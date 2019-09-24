@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -35,24 +36,39 @@
 
 #include "platform.h"
 
+#include <vector>
+
+#define WAYMETRIC_VERSION "0.50"
+
 #define UNUSED(x) ((void)x)
 
 #define DEFAULT_WIDTH (1280)
 #define DEFAULT_HEIGHT (720)
 #define DEFAULT_ITERATIONS (300)
 
+#define FRAME_PERIOD_MILLIS_60FPS (1000/60)
+
 #ifndef PFNEGLGETPLATFORMDISPLAYEXTPROC
 typedef EGLDisplay (EGLAPIENTRYP PFNEGLGETPLATFORMDISPLAYEXTPROC) (EGLenum platform, void *native_display, const EGLint *attrib_list);
 #endif
 
+typedef bool (*PFNREMOTEBEGIN)( struct wl_display *dspsrc, struct wl_display *dspdst );
+typedef void (*PFNREMOTEEND)( struct wl_display *dspsrc, struct wl_display *dspdst );
+typedef struct wl_buffer* (*PFNREMOTECLONEBUFFERFROMRESOURCE)( struct wl_display *dspsrc,
+                                                               struct wl_resource *resource,
+                                                               struct wl_display *dspdst,
+                                                               int *width,
+                                                               int *height );
+
 typedef struct _AppCtx AppCtx;
+typedef struct _WaylandCtx WaylandCtx;
 
 #define MAX_TEXTURES (2)
 
 typedef struct _Surface
 {
    struct wl_resource *resource;
-   AppCtx *appCtx;
+   WaylandCtx *ctx;
    struct wl_listener attachedBufferDestroyListener;
    struct wl_listener detachedBufferDestroyListener;
    struct wl_resource *attachedBufferResource;
@@ -65,6 +81,7 @@ typedef struct _Surface
    EGLImageKHR eglImage[MAX_TEXTURES];
    int bufferWidth;
    int bufferHeight;
+   struct wl_surface *surfaceNested;
 } Surface;
 
 typedef struct _EGLCtx
@@ -74,6 +91,7 @@ typedef struct _EGLCtx
    bool useWayland;
    void *nativeDisplay;
    struct wl_display *dispWayland;
+   bool displayBound;
    EGLDisplay eglDisplay;
    EGLContext eglContext;   
    EGLSurface eglSurface;
@@ -82,12 +100,76 @@ typedef struct _EGLCtx
    EGLint minorVersion;
 } EGLCtx;
 
+typedef struct _GLCtx
+{
+   AppCtx *appCtx;
+   bool haveYUVTextures;
+   bool haveYUVShaders;
+   GLuint frag;
+   GLuint vert;
+   GLuint prog;
+   GLint locPos;
+   GLint locTC;
+   GLint locTCUV;
+   GLint locRes;
+   GLint locMatrix;
+   GLint locTexture;
+   GLint locTextureUV;
+} GLCtx;
+
+typedef struct _NestedBufferInfo
+{
+   WaylandCtx *ctx;
+   struct wl_surface *surface;
+   struct wl_resource *bufferRemote;
+} NestedBufferInfo;
+
+typedef struct _WaylandCtx
+{
+   AppCtx *appCtx;
+   EGLCtx eglServer;
+   EGLCtx eglClient;
+   GLCtx gl;
+   pthread_mutex_t mutex;
+   pthread_mutex_t mutexReady;
+   pthread_cond_t condReady;
+   struct wl_compositor *compositor;
+   struct wl_surface *surface;
+   struct wl_egl_window *winWayland;
+   struct wl_display *dispWayland;
+   struct wl_resource *rescb;
+   struct wl_event_source *displayTimer;
+   const char *upstreamDisplayName;
+   bool isRepeater;
+   struct wl_display *upstreamDisplay;
+   pthread_mutex_t buffersToReleaseMutex;
+   std::vector<NestedBufferInfo> buffersToRelease;
+} WaylandCtx;
+
+typedef struct _MultiComp
+{
+   AppCtx *appCtx;
+   pthread_mutex_t mutexReady;
+   pthread_cond_t condReady;
+   pthread_mutex_t mutexStart;
+   pthread_cond_t condStart;
+   pthread_t threadId;
+   char displayName[16];
+   WaylandCtx ctx;
+   int index;
+   bool started;
+   bool init;
+   bool term;
+   bool error;
+} MultiComp;
+
 typedef struct _AppCtx
 {
    FILE *pReport;
    PlatformCtx *platformCtx;
-   EGLCtx eglServer;
-   EGLCtx eglClient;
+   WaylandCtx master;
+   WaylandCtx nested;
+   WaylandCtx client;
    bool haveWaylandEGL;
    const char *eglVendor;
    const char *eglVersion;
@@ -101,32 +183,20 @@ typedef struct _AppCtx
    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
 
+   PFNREMOTEBEGIN remoteBegin;
+   PFNREMOTEEND remoteEnd;
+   PFNREMOTECLONEBUFFERFROMRESOURCE remoteCloneBufferFromResource;
+   bool canRemoteClone;
+
    pthread_mutex_t mutex;
    const char *displayName;
-   struct wl_display *dispWayland;
+   const char *nestedDisplayName;
    pthread_t clientThreadId;
-   pthread_mutex_t mutexReady;
-   pthread_cond_t condReady;
-   struct wl_resource *rescb;
+   pthread_t clientDispatchThreadId;
+   pthread_t nestedThreadId;
+   pthread_t nestedDispatchThreadId;
    bool renderWayland;
    int pacingDelay;
-
-   bool haveYUVTextures;
-   bool haveYUVShaders;
-   GLuint frag;
-   GLuint vert;
-   GLuint prog;
-   GLint locPos;
-   GLint locTC;
-   GLint locTCUV;
-   GLint locRes;
-   GLint locMatrix;
-   GLint locTexture;
-   GLint locTextureUV;
-
-   struct wl_compositor *compositor;
-   struct wl_surface *surface;
-   struct wl_egl_window *winWayland;
 
    int maxIterations;
    int windowWidth;
@@ -393,7 +463,7 @@ static const char *fragTextureYUV=
   "   gl_FragColor= vec4( dot(cc_r,temp_vec.xyw), dot(cc_g,temp_vec), dot(cc_b,temp_vec.xyz), alpha );\n"
   "}\n";
 
-static bool initGL( AppCtx *ctx )
+static bool initGL( WaylandCtx *ctx )
 {
    bool result= false;
    GLint status;
@@ -401,7 +471,7 @@ static bool initGL( AppCtx *ctx )
    char infoLog[512];
    const char *fragSrc, *vertSrc;
 
-   if ( ctx->haveYUVShaders )
+   if ( ctx->gl.haveYUVShaders )
    {
       fragSrc= fragTextureYUV;
       vertSrc= vertTextureYUV;
@@ -412,69 +482,69 @@ static bool initGL( AppCtx *ctx )
       vertSrc= vertTexture;
    }
 
-   ctx->frag= glCreateShader( GL_FRAGMENT_SHADER );
-   if ( !ctx->frag )
+   ctx->gl.frag= glCreateShader( GL_FRAGMENT_SHADER );
+   if ( !ctx->gl.frag )
    {
       printf("Error: initGL: failed to create fragment shader\n");
       goto exit;
    }
 
-   glShaderSource( ctx->frag, 1, (const char **)&fragSrc, NULL );
-   glCompileShader( ctx->frag );
-   glGetShaderiv( ctx->frag, GL_COMPILE_STATUS, &status );
+   glShaderSource( ctx->gl.frag, 1, (const char **)&fragSrc, NULL );
+   glCompileShader( ctx->gl.frag );
+   glGetShaderiv( ctx->gl.frag, GL_COMPILE_STATUS, &status );
    if ( !status )
    {
-      glGetShaderInfoLog( ctx->frag, sizeof(infoLog), &length, infoLog );
+      glGetShaderInfoLog( ctx->gl.frag, sizeof(infoLog), &length, infoLog );
       printf("Error: initGL: compiling fragment shader: %*s\n", length, infoLog );
       goto exit;
    }
 
-   ctx->vert= glCreateShader( GL_VERTEX_SHADER );
-   if ( !ctx->vert )
+   ctx->gl.vert= glCreateShader( GL_VERTEX_SHADER );
+   if ( !ctx->gl.vert )
    {
       printf("Error: initGL: failed to create vertex shader\n");
       goto exit;
    }
 
-   glShaderSource( ctx->vert, 1, (const char **)&vertSrc, NULL );
-   glCompileShader( ctx->vert );
-   glGetShaderiv( ctx->vert, GL_COMPILE_STATUS, &status );
+   glShaderSource( ctx->gl.vert, 1, (const char **)&vertSrc, NULL );
+   glCompileShader( ctx->gl.vert );
+   glGetShaderiv( ctx->gl.vert, GL_COMPILE_STATUS, &status );
    if ( !status )
    {
-      glGetShaderInfoLog( ctx->vert, sizeof(infoLog), &length, infoLog );
+      glGetShaderInfoLog( ctx->gl.vert, sizeof(infoLog), &length, infoLog );
       printf("Error: initGL: compiling vertex shader: \n%*s\n", length, infoLog );
       goto exit;
    }
 
-   ctx->prog= glCreateProgram();
-   glAttachShader(ctx->prog, ctx->frag);
-   glAttachShader(ctx->prog, ctx->vert);
+   ctx->gl.prog= glCreateProgram();
+   glAttachShader(ctx->gl.prog, ctx->gl.frag);
+   glAttachShader(ctx->gl.prog, ctx->gl.vert);
 
-   ctx->locPos= 0;
-   ctx->locTC= 1;
-   glBindAttribLocation(ctx->prog, ctx->locPos, "pos");
-   glBindAttribLocation(ctx->prog, ctx->locTC, "texcoord");
-   if ( ctx->haveYUVShaders )
+   ctx->gl.locPos= 0;
+   ctx->gl.locTC= 1;
+   glBindAttribLocation(ctx->gl.prog, ctx->gl.locPos, "pos");
+   glBindAttribLocation(ctx->gl.prog, ctx->gl.locTC, "texcoord");
+   if ( ctx->gl.haveYUVShaders )
    {
-      ctx->locTCUV= 2;
-      glBindAttribLocation(ctx->prog, ctx->locTCUV, "texcoorduv");
+      ctx->gl.locTCUV= 2;
+      glBindAttribLocation(ctx->gl.prog, ctx->gl.locTCUV, "texcoorduv");
    }
 
-   glLinkProgram(ctx->prog);
-   glGetProgramiv(ctx->prog, GL_LINK_STATUS, &status);
+   glLinkProgram(ctx->gl.prog);
+   glGetProgramiv(ctx->gl.prog, GL_LINK_STATUS, &status);
    if (!status)
    {
-      glGetProgramInfoLog(ctx->prog, sizeof(infoLog), &length, infoLog);
+      glGetProgramInfoLog(ctx->gl.prog, sizeof(infoLog), &length, infoLog);
       printf("Error: initGL: linking:\n%*s\n", length, infoLog);
       goto exit;
    }
 
-   ctx->locRes= glGetUniformLocation(ctx->prog,"u_resolution");
-   ctx->locMatrix= glGetUniformLocation(ctx->prog,"u_matrix");
-   ctx->locTexture= glGetUniformLocation(ctx->prog,"texture");
-   if ( ctx->haveYUVShaders )
+   ctx->gl.locRes= glGetUniformLocation(ctx->gl.prog,"u_resolution");
+   ctx->gl.locMatrix= glGetUniformLocation(ctx->gl.prog,"u_matrix");
+   ctx->gl.locTexture= glGetUniformLocation(ctx->gl.prog,"texture");
+   if ( ctx->gl.haveYUVShaders )
    {
-      ctx->locTextureUV= glGetUniformLocation(ctx->prog,"textureuv");
+      ctx->gl.locTextureUV= glGetUniformLocation(ctx->gl.prog,"textureuv");
    }
 
    result= true;
@@ -484,34 +554,36 @@ exit:
    return result;
 }
 
-static void termGL( AppCtx *ctx )
+static void termGL( WaylandCtx *ctx )
 {
-   if ( ctx->frag )
+   if ( ctx->gl.frag )
    {
-      glDeleteShader( ctx->frag );
-      ctx->frag= 0;
+      glDeleteShader( ctx->gl.frag );
+      ctx->gl.frag= 0;
    }
-   if ( ctx->vert )
+   if ( ctx->gl.vert )
    {
-      glDeleteShader( ctx->vert );
-      ctx->vert= 0;
+      glDeleteShader( ctx->gl.vert );
+      ctx->gl.vert= 0;
    }
-   if ( ctx->prog )
+   if ( ctx->gl.prog )
    {
-      glDeleteProgram( ctx->prog );
-      ctx->prog= 0;
+      glDeleteProgram( ctx->gl.prog );
+      ctx->gl.prog= 0;
    }
 }
 
-void drawGL( AppCtx *ctx, Surface *surface )
+void drawGL( EGLCtx *eglCtx, Surface *surface )
 {
    int x, y, w, h;
    GLenum glerr;
+   WaylandCtx *ctx= surface->ctx;
+   AppCtx *appCtx= ctx->appCtx;
 
    x= 0;
    y= 0;
-   w= ctx->windowWidth;
-   h= ctx->windowHeight;
+   w= appCtx->windowWidth;
+   h= appCtx->windowHeight;
  
    const float verts[4][2]=
    {
@@ -537,10 +609,10 @@ void drawGL( AppCtx *ctx, Surface *surface )
       {0, 0, 0, 1}
    };
 
-   if ( ctx->haveYUVShaders != ctx->haveYUVTextures )
+   if ( ctx->gl.haveYUVShaders != ctx->gl.haveYUVTextures )
    {
       termGL( ctx );
-      ctx->haveYUVShaders= ctx->haveYUVTextures;
+      ctx->gl.haveYUVShaders= ctx->gl.haveYUVTextures;
       if ( !initGL( ctx ) )
       {
          printf("Error: drawGL: initGL failed while changing shaders\n");
@@ -560,7 +632,7 @@ void drawGL( AppCtx *ctx, Surface *surface )
          glBindTexture(GL_TEXTURE_2D, surface->textureId[i] );
          if ( surface->eglImage[i] )
          {
-            ctx->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, surface->eglImage[i]);
+            appCtx->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, surface->eglImage[i]);
          }
          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -569,31 +641,31 @@ void drawGL( AppCtx *ctx, Surface *surface )
       }
    }
 
-   glUseProgram(ctx->prog);
-   glUniform2f(ctx->locRes, ctx->windowWidth, ctx->windowHeight);
-   glUniformMatrix4fv(ctx->locMatrix, 1, GL_FALSE, (GLfloat*)identityMatrix);
+   glUseProgram(ctx->gl.prog);
+   glUniform2f(ctx->gl.locRes, appCtx->windowWidth, appCtx->windowHeight);
+   glUniformMatrix4fv(ctx->gl.locMatrix, 1, GL_FALSE, (GLfloat*)identityMatrix);
 
    glActiveTexture(GL_TEXTURE0); 
    glBindTexture(GL_TEXTURE_2D, surface->textureId[0]);
-   glUniform1i(ctx->locTexture, 0);
-   glVertexAttribPointer(ctx->locPos, 2, GL_FLOAT, GL_FALSE, 0, verts);
-   glVertexAttribPointer(ctx->locTC, 2, GL_FLOAT, GL_FALSE, 0, uv);
-   glEnableVertexAttribArray(ctx->locPos);
-   glEnableVertexAttribArray(ctx->locTC);
-   if ( ctx->haveYUVTextures )
+   glUniform1i(ctx->gl.locTexture, 0);
+   glVertexAttribPointer(ctx->gl.locPos, 2, GL_FLOAT, GL_FALSE, 0, verts);
+   glVertexAttribPointer(ctx->gl.locTC, 2, GL_FLOAT, GL_FALSE, 0, uv);
+   glEnableVertexAttribArray(ctx->gl.locPos);
+   glEnableVertexAttribArray(ctx->gl.locTC);
+   if ( ctx->gl.haveYUVTextures )
    {
       glActiveTexture(GL_TEXTURE1); 
       glBindTexture(GL_TEXTURE_2D, surface->textureId[1]);
-      glUniform1i(ctx->locTexture, 1);
-      glVertexAttribPointer(ctx->locTCUV, 2, GL_FLOAT, GL_FALSE, 0, uv);
-      glEnableVertexAttribArray(ctx->locTCUV);
+      glUniform1i(ctx->gl.locTexture, 1);
+      glVertexAttribPointer(ctx->gl.locTCUV, 2, GL_FLOAT, GL_FALSE, 0, uv);
+      glEnableVertexAttribArray(ctx->gl.locTCUV);
    }
    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-   glDisableVertexAttribArray(ctx->locPos);
-   glDisableVertexAttribArray(ctx->locTC);
-   if ( ctx->haveYUVTextures )
+   glDisableVertexAttribArray(ctx->gl.locPos);
+   glDisableVertexAttribArray(ctx->gl.locTC);
+   if ( ctx->gl.haveYUVTextures )
    {
-      glDisableVertexAttribArray(ctx->locTCUV);
+      glDisableVertexAttribArray(ctx->gl.locTCUV);
    }
    
    glerr= glGetError();
@@ -602,219 +674,19 @@ void drawGL( AppCtx *ctx, Surface *surface )
       printf("Warning: drawGL: glGetError: %X\n", glerr);
    }
 
-   eglSwapBuffers( ctx->eglServer.eglDisplay, ctx->eglServer.eglSurface );
-}
-
-static void registryAdd(void *data, 
-                        struct wl_registry *registry, uint32_t id,
-                        const char *interface, uint32_t version)
-{
-   AppCtx *ctx = (AppCtx*)data;
-   int len;
-
-   len= strlen(interface);
-   if ( (len==13) && !strncmp(interface, "wl_compositor", len) ) {
-      ctx->compositor= (struct wl_compositor*)wl_registry_bind(registry, id, &wl_compositor_interface, 1);
-   }
-}
-
-static void registryRemove(void *, struct wl_registry *, uint32_t)
-{
-   // ignore
-}
-
-static const struct wl_registry_listener registryListener=
-{
-   registryAdd,
-   registryRemove
-};
-
-static void* waylandClientThread( void *arg )
-{
-   AppCtx *ctx= (AppCtx*)arg;
-   struct wl_display *dispWayland= 0;
-   struct wl_registry *registry= 0;
-   long long time1, time2, diff;
-   GLfloat r, g, b, t;
-   int pacingInc, step, maxStep;
-
-   fprintf(ctx->pReport, "\n");
-   fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
-   fprintf(ctx->pReport, "Measuring EGL Wayland...\n");
-   printf("\nMeasuring EGL Wayland...\n");
-
-   pthread_mutex_lock( &ctx->mutexReady );
-   pthread_cond_signal( &ctx->condReady );
-   pthread_mutex_unlock( &ctx->mutexReady );
-
-   dispWayland= wl_display_connect( ctx->displayName );
-   if ( !dispWayland )
-   {
-      printf("Error: waylandClientThread: failed to connect to display\n");
-      goto exit;
-   }
-
-   registry= wl_display_get_registry(dispWayland);
-   if ( !registry )
-   {
-      printf("Error: waylandClientThread: failed tp get wayland registry\n");
-      goto exit;
-   }
-
-   wl_registry_add_listener(registry, &registryListener, ctx);
-
-   wl_display_roundtrip( dispWayland );
-
-   if ( !ctx->compositor )
-   {
-      printf("Error: waylandClientThread: failed to obtain wayland compositor\n");
-      goto exit;
-   }
-
-   ctx->eglClient.useWayland= true;
-   ctx->eglClient.dispWayland= dispWayland;
-   if ( !initEGL( &ctx->eglClient ) )
-   {
-      printf("Error: waylandClientThread: failed to setup EGL\n");
-      goto exit;
-   }
-
-   ctx->surface= wl_compositor_create_surface(ctx->compositor);
-   if ( !ctx->surface )
-   {
-      printf("Error: waylandClientThread: failed to create wayland surface\n");
-      goto exit;
-   }
-
-   ctx->winWayland= wl_egl_window_create(ctx->surface, ctx->windowWidth, ctx->windowHeight);
-   if ( !ctx->winWayland )
-   {
-      printf("Error: waylandClientThread: failed to create wayland window\n");
-      goto exit;
-   }
-
-   ctx->eglClient.eglSurface= eglCreateWindowSurface( ctx->eglClient.eglDisplay,
-                                                      ctx->eglClient.eglConfig,
-                                                      (EGLNativeWindowType)ctx->winWayland,
-                                                      NULL );
-   if ( ctx->eglClient.eglSurface == EGL_NO_SURFACE )
-   {
-      printf("Error: waylandClientThread: failed to create EGL surface\n");
-      goto exit;
-   }
-
-   eglMakeCurrent( ctx->eglClient.eglDisplay, ctx->eglClient.eglSurface, 
-                   ctx->eglClient.eglSurface, ctx->eglClient.eglContext );
-
-   eglSwapInterval( ctx->eglClient.eglDisplay, 1 );
-
-   glClearColor( 0, 0, 0, 1 );
-   glClear( GL_COLOR_BUFFER_BIT );
-   eglSwapBuffers( ctx->eglClient.eglDisplay, ctx->eglClient.eglSurface );
-   usleep( 1500000 );
-
-   pacingInc= 1000;
-   maxStep= 17;
-   ctx->pacingDelay= 0;
-   for( step= 0; step <= maxStep; ++step  )
-   {
-      fprintf(ctx->pReport, "\n");
-      fprintf(ctx->pReport, "%d) pacing %d us\n", step+1, ctx->pacingDelay);
-      printf("%d) pacing %d us\n", step+1, ctx->pacingDelay);
-
-      ctx->waylandEGLIterationCount= 0;
-      ctx->waylandEGLTimeTotal= 0;
-
-      r= 0;
-      g= 1;
-      b= 0;
-      time1= getCurrentTimeMicro();
-      for( int i= 0; i < ctx->maxIterations; ++i )
-      {
-         t= r;
-         r= g;
-         g= b;
-         b= t;
-         glClearColor( r, g, b, 1 );
-         glClear( GL_COLOR_BUFFER_BIT );
-         if ( ctx->pacingDelay )
-         {
-            usleep( ctx->pacingDelay );
-         }
-         eglSwapBuffers( ctx->eglClient.eglDisplay, ctx->eglClient.eglSurface );
-      }
-      time2= getCurrentTimeMicro();
-
-      diff= (time2-time1);
-      ctx->waylandEGLIterationCount += ctx->maxIterations;
-      ctx->waylandEGLTimeTotal += diff;
-      if ( ctx->waylandEGLIterationCount )
-      {
-         ctx->waylandEGLFPS= ((double)(ctx->waylandEGLIterationCount*1000000.0)) / (double)(ctx->waylandEGLTimeTotal);
-      }
-
-      fprintf(ctx->pReport, "Iterations: %d Total time (us): %lld  FPS: %f\n", 
-              ctx->waylandEGLIterationCount, ctx->waylandEGLTimeTotal, ctx->waylandEGLFPS );
-
-      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
-
-      ctx->pacingDelay += pacingInc;
-      ctx->waylandTotal += ctx->waylandEGLTimeTotal;
-   }
-
-   glClearColor( 0, 0, 0, 1 );
-   glClear( GL_COLOR_BUFFER_BIT );
-   eglSwapBuffers( ctx->eglClient.eglDisplay, ctx->eglClient.eglSurface );
-   usleep( 1500000 );
-
-exit:
-
-   if ( ctx->surface )
-   {
-      wl_surface_destroy( ctx->surface );
-      ctx->surface= 0;
-   }
-
-   if ( ctx->compositor )
-   {
-      wl_compositor_destroy( ctx->compositor );
-      ctx->compositor= 0;
-   }
-
-   //TODO: why does this crash on some devices?
-   //termEGL( &ctx->eglClient );
-
-   if ( ctx->winWayland )
-   {
-      wl_egl_window_destroy( ctx->winWayland );
-      ctx->winWayland= 0;
-   }
-
-   if ( registry )
-   {
-      wl_registry_destroy(registry);
-      registry= 0;
-   }
-
-   if ( ctx->dispWayland )
-   {
-      wl_display_terminate( ctx->dispWayland );
-   }
-
-   if ( dispWayland )
-   {
-      wl_display_roundtrip( dispWayland );
-      wl_display_disconnect( dispWayland );
-      dispWayland= 0;  
-   }
-
-   return NULL;
+   eglSwapBuffers( eglCtx->eglDisplay, eglCtx->eglSurface );
 }
 
 static void surfaceDestroy(struct wl_client *client, struct wl_resource *resource)
 {
    Surface *surface= (Surface*)wl_resource_get_user_data(resource);
 
+   if ( surface->surfaceNested )
+   {
+      wl_surface_destroy( surface->surfaceNested );
+      wl_display_flush( surface->ctx->upstreamDisplay );
+      surface->surfaceNested= 0;
+   }
    wl_resource_destroy(resource);
 }
 
@@ -824,7 +696,7 @@ static void surfaceAttach(struct wl_client *client,
 {
    Surface *surface= (Surface*)wl_resource_get_user_data(resource);
 
-   pthread_mutex_lock( &surface->appCtx->mutex );
+   pthread_mutex_lock( &surface->ctx->mutex );
    if ( surface->attachedBufferResource != bufferResource )
    {
       if ( surface->detachedBufferResource )
@@ -853,7 +725,7 @@ static void surfaceAttach(struct wl_client *client,
       surface->attachedX= sx;
       surface->attachedY= sy;
    }
-   pthread_mutex_unlock( &surface->appCtx->mutex );
+   pthread_mutex_unlock( &surface->ctx->mutex );
 }
 
 static void surfaceDamage(struct wl_client *, struct wl_resource *, int32_t, int32_t, int32_t, int32_t)
@@ -869,7 +741,7 @@ static void surfaceFrame(struct wl_client *client, struct wl_resource *resource,
    rescb= wl_resource_create( client, &wl_callback_interface, 1, callback );
    if ( rescb )
    {
-      surface->appCtx->rescb= rescb;
+      surface->ctx->rescb= rescb;
    }
    else
    {
@@ -887,38 +759,93 @@ static void surfaceSetInputRegion(struct wl_client *, struct wl_resource *, stru
    // ignore
 }
 
+static void buffer_release( void *data, struct wl_buffer *buffer )
+{
+   NestedBufferInfo *buffInfo= (NestedBufferInfo*)data;
+
+   wl_buffer_destroy( buffer );
+
+   if ( buffInfo )
+   {
+      if ( buffInfo->bufferRemote )
+      {
+         pthread_mutex_lock( &buffInfo->ctx->buffersToReleaseMutex );
+         buffInfo->ctx->buffersToRelease.push_back( *buffInfo );
+         pthread_mutex_unlock( &buffInfo->ctx->buffersToReleaseMutex );
+      }
+      free( buffInfo );
+   }
+}
+
+static struct wl_buffer_listener wl_buffer_listener=
+{
+   buffer_release
+};
+
 static void surfaceCommit(struct wl_client *client, struct wl_resource *resource)
 {
    Surface *surface= (Surface*)wl_resource_get_user_data(resource);
    struct wl_resource *committedBufferResource;
-   AppCtx *ctx= surface->appCtx;
+   WaylandCtx *ctx= surface->ctx;
+   AppCtx *appCtx= ctx->appCtx;
 
    pthread_mutex_lock( &ctx->mutex );
 
    committedBufferResource= surface->attachedBufferResource;
    if ( committedBufferResource )
    {
-      if ( surface->appCtx->renderWayland )
+      if ( ctx->isRepeater )
+      {
+         struct wl_buffer *clone;
+         int bufferWidth, bufferHeight;
+
+         clone= appCtx->remoteCloneBufferFromResource( appCtx->nested.dispWayland,
+                                                       committedBufferResource,
+                                                       appCtx->nested.upstreamDisplay,
+                                                       &bufferWidth,
+                                                       &bufferHeight );
+         if ( clone )
+         {
+            NestedBufferInfo *buffInfo= (NestedBufferInfo*)malloc( sizeof(NestedBufferInfo) );
+            if ( buffInfo )
+            {
+               buffInfo->ctx= ctx;
+               buffInfo->surface= surface->surfaceNested;
+               buffInfo->bufferRemote= committedBufferResource;
+               wl_buffer_add_listener( clone, &wl_buffer_listener, buffInfo );
+            }
+
+            wl_surface_attach( surface->surfaceNested, clone, 0, 0 );
+            wl_surface_damage( surface->surfaceNested, 0, 0, bufferWidth, bufferHeight);
+            wl_surface_commit( surface->surfaceNested );
+            wl_display_flush( appCtx->nested.upstreamDisplay );
+
+            wl_list_remove(&surface->attachedBufferDestroyListener.link);
+            surface->attachedBufferResource= 0;
+         }
+      }
+      else
+      if ( appCtx->renderWayland )
       {
          EGLImageKHR eglImage= 0;
          EGLint value, format;
          EGLint attrList[3];
          int bufferWidth= 0, bufferHeight= 0;
 
-         if (EGL_TRUE == ctx->eglQueryWaylandBufferWL( ctx->eglServer.eglDisplay, committedBufferResource,
-                                                       EGL_WIDTH, &value ) )
+         if (EGL_TRUE == appCtx->eglQueryWaylandBufferWL( ctx->eglServer.eglDisplay, committedBufferResource,
+                                                          EGL_WIDTH, &value ) )
          {
             bufferWidth= value;
-         }                                                        
+         }
 
-         if (EGL_TRUE == ctx->eglQueryWaylandBufferWL( ctx->eglServer.eglDisplay, committedBufferResource,
-                                                       EGL_HEIGHT, &value ) )
+         if (EGL_TRUE == appCtx->eglQueryWaylandBufferWL( ctx->eglServer.eglDisplay, committedBufferResource,
+                                                          EGL_HEIGHT, &value ) )
          {
             bufferHeight= value;
          }                                                        
 
-         if (EGL_TRUE == ctx->eglQueryWaylandBufferWL( ctx->eglServer.eglDisplay, committedBufferResource,
-                                                       EGL_TEXTURE_FORMAT, &value ) )
+         if (EGL_TRUE == appCtx->eglQueryWaylandBufferWL( ctx->eglServer.eglDisplay, committedBufferResource,
+                                                          EGL_TEXTURE_FORMAT, &value ) )
          {
             format= value;
          }
@@ -933,7 +860,7 @@ static void surfaceCommit(struct wl_client *client, struct wl_resource *resource
          {
             if ( surface->eglImage[i] )
             {
-               ctx->eglDestroyImageKHR( ctx->eglServer.eglDisplay, surface->eglImage[i] );
+               appCtx->eglDestroyImageKHR( ctx->eglServer.eglDisplay, surface->eglImage[i] );
                surface->eglImage[i]= 0;
             }
          }
@@ -942,7 +869,7 @@ static void surfaceCommit(struct wl_client *client, struct wl_resource *resource
          {
             case EGL_TEXTURE_RGB:
             case EGL_TEXTURE_RGBA:
-               eglImage= ctx->eglCreateImageKHR( ctx->eglServer.eglDisplay, EGL_NO_CONTEXT,
+               eglImage= appCtx->eglCreateImageKHR( ctx->eglServer.eglDisplay, EGL_NO_CONTEXT,
                                                         EGL_WAYLAND_BUFFER_WL, committedBufferResource,
                                                         NULL // EGLInt attrList[]
                                                        );
@@ -956,7 +883,7 @@ static void surfaceCommit(struct wl_client *client, struct wl_resource *resource
                   surface->textureId[0]= GL_NONE;
                   surface->textureCount= 1;
                }
-               ctx->haveYUVTextures= false;
+               ctx->gl.haveYUVTextures= false;
                break;
             
             case EGL_TEXTURE_Y_U_V_WL:
@@ -970,7 +897,7 @@ static void surfaceCommit(struct wl_client *client, struct wl_resource *resource
                {
                   attrList[1]= i;
                   
-                  eglImage= ctx->eglCreateImageKHR( ctx->eglServer.eglDisplay, EGL_NO_CONTEXT,
+                  eglImage= appCtx->eglCreateImageKHR( ctx->eglServer.eglDisplay, EGL_NO_CONTEXT,
                                                            EGL_WAYLAND_BUFFER_WL, committedBufferResource,
                                                            attrList
                                                           );
@@ -985,7 +912,7 @@ static void surfaceCommit(struct wl_client *client, struct wl_resource *resource
                   }
                }
                surface->textureCount= 2;
-               ctx->haveYUVTextures= true;
+               ctx->gl.haveYUVTextures= true;
                break;
                
             case EGL_TEXTURE_Y_XUXV_WL:
@@ -997,7 +924,7 @@ static void surfaceCommit(struct wl_client *client, struct wl_resource *resource
                break;
          }
 
-         drawGL( ctx, surface );
+         drawGL( &ctx->eglServer, surface );
       }
 
       if ( ctx->rescb )
@@ -1050,7 +977,7 @@ static void destroySurfaceCallback(struct wl_resource *resource)
 {
    Surface *surface= (Surface*)wl_resource_get_user_data(resource);
 
-   AppCtx *ctx= surface->appCtx;
+   WaylandCtx *ctx= surface->ctx;
 
    pthread_mutex_lock( &ctx->mutex );
 
@@ -1081,7 +1008,7 @@ static void destroySurfaceCallback(struct wl_resource *resource)
 
 static void compositorCreateSurface( struct wl_client *client, struct wl_resource *resource, uint32_t id)
 {
-   AppCtx *ctx= (AppCtx*)wl_resource_get_user_data(resource);
+   WaylandCtx *ctx= (WaylandCtx*)wl_resource_get_user_data(resource);
    Surface *surface;
    
    pthread_mutex_lock( &ctx->mutex );
@@ -1094,7 +1021,7 @@ static void compositorCreateSurface( struct wl_client *client, struct wl_resourc
       return;
    }
 
-   surface->appCtx= ctx;
+   surface->ctx= ctx;
    surface->refCount= 1;
    surface->attachedBufferDestroyListener.notify= attachedBufferDestroyCallback;
    surface->detachedBufferDestroyListener.notify= detachedBufferDestroyCallback;
@@ -1109,6 +1036,19 @@ static void compositorCreateSurface( struct wl_client *client, struct wl_resourc
    }
 
    wl_resource_set_implementation(surface->resource, &surface_interface, surface, destroySurfaceCallback);
+
+   if ( ctx->isRepeater )
+   {
+      surface->surfaceNested= wl_compositor_create_surface(ctx->compositor);
+      wl_display_flush( ctx->upstreamDisplay );
+      if ( !surface->surfaceNested )
+      {
+         free(surface);
+         wl_resource_post_no_memory(resource);
+         pthread_mutex_unlock( &ctx->mutex );
+         return;
+      }
+   }
 
    pthread_mutex_unlock( &ctx->mutex );
 }
@@ -1126,7 +1066,7 @@ static const struct wl_compositor_interface compositor_interface=
 
 static void compositorBind( struct wl_client *client, void *data, uint32_t version, uint32_t id)
 {
-   AppCtx *ctx= (AppCtx*)data;
+   WaylandCtx *ctx= (WaylandCtx*)data;
    struct wl_resource *resource;
 
    resource= wl_resource_create(client, &wl_compositor_interface, version, id);
@@ -1140,11 +1080,10 @@ static void compositorBind( struct wl_client *client, void *data, uint32_t versi
    }
 }
 
-bool initWayland( AppCtx *ctx )
+static bool initWayland( WaylandCtx *ctx, const char *displayName )
 {
    bool result= false;
-
-   setenv( "XDG_RUNTIME_DIR", "/tmp", true );
+   AppCtx *appCtx= ctx->appCtx;
 
    ctx->dispWayland= wl_display_create();
    if ( !ctx->dispWayland )
@@ -1159,17 +1098,18 @@ bool initWayland( AppCtx *ctx )
       goto exit;
    }
 
-   if ( wl_display_add_socket( ctx->dispWayland, ctx->displayName ) )
+   if ( wl_display_add_socket( ctx->dispWayland, displayName ) )
    {
       printf("Error: initWayland: failed to add socket\n");
       goto exit;
    }
 
-   if ( !ctx->eglBindWaylandDisplayWL( ctx->eglServer.eglDisplay, ctx->dispWayland ) )
+   if ( !appCtx->eglBindWaylandDisplayWL( ctx->eglServer.eglDisplay, ctx->dispWayland ) )
    {
       printf("Error: initWayland: failed to bind EGL to wayland display\n");
       goto exit;
    }
+   ctx->eglServer.displayBound= true;
 
    result= true;
 
@@ -1177,20 +1117,494 @@ exit:
    return result;
 }
 
-void termWayland( AppCtx *ctx )
+static void termWayland( WaylandCtx *ctx )
 {
+   AppCtx *appCtx= ctx->appCtx;
    if ( ctx->dispWayland )
    {
-      ctx->eglUnbindWaylandDisplayWL( ctx->eglServer.eglDisplay, ctx->dispWayland );
+      if ( ctx->eglServer.displayBound )
+      {
+         appCtx->eglUnbindWaylandDisplayWL( ctx->eglServer.eglDisplay, ctx->dispWayland );
+         ctx->eglServer.displayBound= false;
+      }
 
       wl_display_destroy(ctx->dispWayland);
       ctx->dispWayland= 0;
    }
-
-   unsetenv( "XDG_RUNTIME_DIR" );
 }
 
-void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
+namespace waylandClient
+{
+static void registryAdd(void *data,
+                        struct wl_registry *registry, uint32_t id,
+                        const char *interface, uint32_t version)
+{
+   WaylandCtx *ctx = (WaylandCtx*)data;
+   int len;
+
+   len= strlen(interface);
+   if ( (len==13) && !strncmp(interface, "wl_compositor", len) ) {
+      ctx->compositor= (struct wl_compositor*)wl_registry_bind(registry, id, &wl_compositor_interface, 1);
+   }
+}
+
+static void registryRemove(void *, struct wl_registry *, uint32_t)
+{
+   // ignore
+}
+
+static const struct wl_registry_listener registryListener=
+{
+   registryAdd,
+   registryRemove
+};
+} // namespace waylandClient
+
+static void* waylandClientThread( void *arg )
+{
+   using namespace waylandClient;
+
+   AppCtx *ctx= (AppCtx*)arg;
+   struct wl_display *dispWayland= 0;
+   struct wl_registry *registry= 0;
+   long long time1, time2, diff;
+   GLfloat r, g, b, t;
+   int rc, pacingInc, step, maxStep;
+
+   pthread_mutex_lock( &ctx->client.mutexReady );
+   pthread_cond_signal( &ctx->client.condReady );
+   pthread_mutex_unlock( &ctx->client.mutexReady );
+
+   dispWayland= wl_display_connect( ctx->client.upstreamDisplayName );
+   if ( !dispWayland )
+   {
+      printf("Error: waylandClientThread: failed to connect to display\n");
+      goto exit;
+   }
+   ctx->client.upstreamDisplay= dispWayland;
+
+   registry= wl_display_get_registry(dispWayland);
+   if ( !registry )
+   {
+      printf("Error: waylandClientThread: failed tp get wayland registry\n");
+      goto exit;
+   }
+
+   wl_registry_add_listener(registry, &registryListener, &ctx->client);
+
+   wl_display_roundtrip( dispWayland );
+
+   if ( !ctx->client.compositor )
+   {
+      printf("Error: waylandClientThread: failed to obtain wayland compositor\n");
+      goto exit;
+   }
+
+   ctx->client.eglClient.useWayland= true;
+   ctx->client.eglClient.dispWayland= dispWayland;
+   if ( !initEGL( &ctx->client.eglClient ) )
+   {
+      printf("Error: waylandClientThread: failed to setup EGL\n");
+      goto exit;
+   }
+
+   ctx->client.surface= wl_compositor_create_surface(ctx->client.compositor);
+   if ( !ctx->client.surface )
+   {
+      printf("Error: waylandClientThread: failed to create wayland surface\n");
+      goto exit;
+   }
+
+   ctx->client.winWayland= wl_egl_window_create(ctx->client.surface, ctx->windowWidth, ctx->windowHeight);
+   if ( !ctx->client.winWayland )
+   {
+      printf("Error: waylandClientThread: failed to create wayland window\n");
+      goto exit;
+   }
+
+   ctx->client.eglClient.eglSurface= eglCreateWindowSurface( ctx->client.eglClient.eglDisplay,
+                                                      ctx->client.eglClient.eglConfig,
+                                                      (EGLNativeWindowType)ctx->client.winWayland,
+                                                      NULL );
+   if ( ctx->client.eglClient.eglSurface == EGL_NO_SURFACE )
+   {
+      printf("Error: waylandClientThread: failed to create EGL surface\n");
+      goto exit;
+   }
+
+   eglMakeCurrent( ctx->client.eglClient.eglDisplay, ctx->client.eglClient.eglSurface,
+                   ctx->client.eglClient.eglSurface, ctx->client.eglClient.eglContext );
+
+   eglSwapInterval( ctx->client.eglClient.eglDisplay, 1 );
+
+   glClearColor( 0, 0, 0, 1 );
+   glClear( GL_COLOR_BUFFER_BIT );
+   eglSwapBuffers( ctx->client.eglClient.eglDisplay, ctx->client.eglClient.eglSurface );
+   usleep( 1500000 );
+
+   pacingInc= 1000;
+   maxStep= 17;
+   ctx->pacingDelay= 0;
+   for( step= 0; step <= maxStep; ++step  )
+   {
+      fprintf(ctx->pReport, "\n");
+      fprintf(ctx->pReport, "%d) pacing %d us\n", step+1, ctx->pacingDelay);
+      printf("%d) pacing %d us\n", step+1, ctx->pacingDelay);
+
+      ctx->waylandEGLIterationCount= 0;
+      ctx->waylandEGLTimeTotal= 0;
+
+      r= 0;
+      g= 1;
+      b= 0;
+      time1= getCurrentTimeMicro();
+      for( int i= 0; i < ctx->maxIterations; ++i )
+      {
+         t= r;
+         r= g;
+         g= b;
+         b= t;
+         glClearColor( r, g, b, 1 );
+         glClear( GL_COLOR_BUFFER_BIT );
+         if ( ctx->pacingDelay )
+         {
+            usleep( ctx->pacingDelay );
+         }
+         eglSwapBuffers( ctx->client.eglClient.eglDisplay, ctx->client.eglClient.eglSurface );
+      }
+      time2= getCurrentTimeMicro();
+
+      diff= (time2-time1);
+      ctx->waylandEGLIterationCount += ctx->maxIterations;
+      ctx->waylandEGLTimeTotal += diff;
+      if ( ctx->waylandEGLIterationCount )
+      {
+         ctx->waylandEGLFPS= ((double)(ctx->waylandEGLIterationCount*1000000.0)) / (double)(ctx->waylandEGLTimeTotal);
+      }
+
+      fprintf(ctx->pReport, "Iterations: %d Total time (us): %lld  FPS: %f\n",
+              ctx->waylandEGLIterationCount, ctx->waylandEGLTimeTotal, ctx->waylandEGLFPS );
+
+      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
+
+      ctx->pacingDelay += pacingInc;
+      ctx->waylandTotal += ctx->waylandEGLTimeTotal;
+   }
+
+   glClearColor( 0, 0, 0, 1 );
+   glClear( GL_COLOR_BUFFER_BIT );
+   eglSwapBuffers( ctx->client.eglClient.eglDisplay, ctx->client.eglClient.eglSurface );
+   usleep( 1500000 );
+
+exit:
+
+   if ( ctx->client.surface )
+   {
+      wl_surface_destroy( ctx->client.surface );
+      ctx->client.surface= 0;
+   }
+
+   if ( ctx->client.compositor )
+   {
+      wl_compositor_destroy( ctx->client.compositor );
+      ctx->client.compositor= 0;
+   }
+
+   //TODO: why does this crash on some devices?
+   if ( strcmp( ctx->eglVendor, "ARM" ) !=  0 )
+   {
+      termEGL( &ctx->client.eglClient );
+   }
+
+   if ( ctx->client.winWayland )
+   {
+      wl_egl_window_destroy( ctx->client.winWayland );
+      ctx->client.winWayland= 0;
+   }
+
+   if ( registry )
+   {
+      wl_registry_destroy(registry);
+      registry= 0;
+   }
+
+   if ( ctx->client.upstreamDisplayName == ctx->nestedDisplayName )
+   {
+      if ( ctx->nested.dispWayland )
+      {
+         wl_display_terminate( ctx->nested.dispWayland );
+      }
+   }
+   else
+   {
+      if ( ctx->master.dispWayland )
+      {
+         wl_display_terminate( ctx->master.dispWayland );
+      }
+   }
+
+   if ( dispWayland )
+   {
+      wl_display_roundtrip( dispWayland );
+      wl_display_disconnect( dispWayland );
+      dispWayland= 0;
+   }
+
+   return NULL;
+}
+
+namespace waylandNested
+{
+static void registryAdd(void *data,
+                        struct wl_registry *registry, uint32_t id,
+                        const char *interface, uint32_t version)
+{
+   WaylandCtx *ctx = (WaylandCtx*)data;
+   int len;
+
+   len= strlen(interface);
+   if ( (len==13) && !strncmp(interface, "wl_compositor", len) ) {
+      ctx->compositor= (struct wl_compositor*)wl_registry_bind(registry, id, &wl_compositor_interface, 1);
+   }
+}
+
+static void registryRemove(void *, struct wl_registry *, uint32_t)
+{
+   // ignore
+}
+
+static const struct wl_registry_listener registryListener=
+{
+   registryAdd,
+   registryRemove
+};
+} // namespace waylandNested
+
+static void* waylandNestedDispatchThread( void *arg )
+{
+   AppCtx *ctx= (AppCtx*)arg;
+   if ( ctx )
+   {
+      for( ; ; )
+      {
+         if ( wl_display_dispatch( ctx->nested.upstreamDisplay ) == -1 )
+         {
+            break;
+         }
+         wl_display_flush( ctx->nested.upstreamDisplay );
+      }
+   }
+   return NULL;
+}
+
+static int nestedDisplayTimeOut( void *data )
+{
+   AppCtx *ctx= (AppCtx*)data;
+   long long frameTime, now;
+   int nextFrameDelay;
+
+   frameTime= getCurrentTimeMillis();
+
+   pthread_mutex_lock( &ctx->nested.buffersToReleaseMutex );
+   while( ctx->nested.buffersToRelease.size() )
+   {
+      std::vector<NestedBufferInfo>::iterator it= ctx->nested.buffersToRelease.begin();
+      struct wl_resource *bufferResource= (*it).bufferRemote;
+      wl_buffer_send_release( bufferResource );
+      ctx->nested.buffersToRelease.erase(it);
+   }
+   pthread_mutex_unlock( &ctx->nested.buffersToReleaseMutex );
+
+   now= getCurrentTimeMillis();
+
+   nextFrameDelay= (FRAME_PERIOD_MILLIS_60FPS-(now-frameTime));
+   if ( nextFrameDelay < 1 ) nextFrameDelay= 1;
+
+   wl_event_source_timer_update( ctx->nested.displayTimer, nextFrameDelay );
+
+   return 0;
+}
+
+static void* waylandNestedThread( void *arg )
+{
+   using namespace waylandNested;
+
+   AppCtx *ctx= (AppCtx*)arg;
+   struct wl_display *dispWayland= 0;
+   struct wl_registry *registry= 0;
+   int rc;
+
+   pthread_mutex_lock( &ctx->nested.mutexReady );
+   pthread_cond_signal( &ctx->nested.condReady );
+   pthread_mutex_unlock( &ctx->nested.mutexReady );
+
+   dispWayland= wl_display_connect( ctx->displayName );
+   printf("waylandNestedThread: dispWayland %p from name %s\n", dispWayland, ctx->displayName);
+   if ( !dispWayland )
+   {
+      printf("Error: waylandNestedThread: failed to connect to display\n");
+      goto exit;
+   }
+   ctx->nested.upstreamDisplay= dispWayland;
+
+   registry= wl_display_get_registry(dispWayland);
+   if ( !registry )
+   {
+      printf("Error: waylandNestedThread: failed tp get wayland registry\n");
+      goto exit;
+   }
+
+   wl_registry_add_listener(registry, &registryListener, &ctx->nested);
+
+   wl_display_roundtrip( dispWayland );
+
+   if ( !ctx->nested.compositor )
+   {
+      printf("Error: waylandNestedThread: failed to obtain wayland compositor\n");
+      goto exit;
+   }
+
+   ctx->nested.eglServer.useWayland= true;
+   ctx->nested.eglServer.dispWayland= dispWayland;
+   if ( !initEGL( &ctx->nested.eglServer ) )
+   {
+      printf("Error: waylandNestedThread: failed to setup EGL\n");
+      goto exit;
+   }
+
+   ctx->nested.surface= wl_compositor_create_surface(ctx->nested.compositor);
+   if ( !ctx->nested.surface )
+   {
+      printf("Error: waylandNestedThread: failed to create wayland surface\n");
+      goto exit;
+   }
+
+   ctx->nested.winWayland= wl_egl_window_create(ctx->nested.surface, ctx->windowWidth, ctx->windowHeight);
+   if ( !ctx->nested.winWayland )
+   {
+      printf("Error: waylandNestedThread: failed to create wayland window\n");
+      goto exit;
+   }
+
+   ctx->nested.eglServer.eglSurface= eglCreateWindowSurface( ctx->nested.eglServer.eglDisplay,
+                                                      ctx->nested.eglServer.eglConfig,
+                                                      (EGLNativeWindowType)ctx->nested.winWayland,
+                                                      NULL );
+   if ( ctx->nested.eglServer.eglSurface == EGL_NO_SURFACE )
+   {
+      printf("Error: waylandNestedThread: failed to create EGL surface\n");
+      goto exit;
+   }
+
+   eglMakeCurrent( ctx->nested.eglServer.eglDisplay, ctx->nested.eglServer.eglSurface,
+                   ctx->nested.eglServer.eglSurface, ctx->nested.eglServer.eglContext );
+
+   eglSwapInterval( ctx->nested.eglServer.eglDisplay, 1 );
+
+   if ( !initGL( &ctx->nested ) )
+   {
+      printf("Error: waylandNestedThread: initGL failed\n");
+   }
+
+   if ( !initWayland( &ctx->nested, ctx->nestedDisplayName ) )
+   {
+      printf("Error: waylandNestedThread: initWayland failed\n");
+      goto exit;
+   }
+
+   if ( ctx->canRemoteClone )
+   {
+      if ( !ctx->remoteBegin( ctx->nested.dispWayland, dispWayland ) )
+      {
+         printf("Error: waylandNestedThread: remoteBegin failure\n");
+         ctx->canRemoteClone= false;
+         goto exit;
+      }
+      pthread_mutex_init( &ctx->nested.buffersToReleaseMutex, 0 );
+      ctx->nested.buffersToRelease= std::vector<NestedBufferInfo>();
+      ctx->nested.displayTimer= wl_event_loop_add_timer( wl_display_get_event_loop(ctx->nested.dispWayland), nestedDisplayTimeOut, ctx );
+      wl_event_source_timer_update( ctx->nested.displayTimer, FRAME_PERIOD_MILLIS_60FPS );
+      rc= pthread_create( &ctx->nestedDispatchThreadId, NULL, waylandNestedDispatchThread, ctx );
+      if ( rc )
+      {
+         printf("Error: waylandNestedThread: failed to start nested dispatch thread\n");
+      }
+      ctx->nested.isRepeater= true;
+   }
+
+   ctx->client.upstreamDisplayName= ctx->nestedDisplayName;
+   pthread_mutex_lock( &ctx->client.mutexReady );
+   rc= pthread_create( &ctx->clientThreadId, NULL, waylandClientThread, ctx );
+   if ( !rc )
+   {
+      pthread_cond_wait( &ctx->client.condReady, &ctx->client.mutexReady );
+      pthread_mutex_unlock( &ctx->client.mutexReady );
+
+      wl_display_run( ctx->nested.dispWayland );
+   }
+   else
+   {
+      pthread_mutex_unlock( &ctx->client.mutexReady );
+   }
+
+exit:
+   eglMakeCurrent( ctx->nested.eglServer.eglDisplay, EGL_NO_CONTEXT, EGL_NO_SURFACE, EGL_NO_SURFACE );
+
+   if ( ctx->nested.eglServer.eglSurface != EGL_NO_SURFACE )
+   {
+      termGL( &ctx->nested );
+
+      eglDestroySurface( ctx->nested.eglServer.eglDisplay, ctx->nested.eglServer.eglSurface );
+      ctx->nested.eglServer.eglSurface= EGL_NO_SURFACE;
+   }
+
+   if ( ctx->canRemoteClone )
+   {
+      ctx->remoteEnd( ctx->nested.dispWayland, dispWayland );
+   }
+
+   termWayland( &ctx->nested );
+
+   if ( ctx->nested.surface )
+   {
+      wl_surface_destroy( ctx->nested.surface );
+      ctx->nested.surface= 0;
+   }
+
+   if ( ctx->nested.compositor )
+   {
+      wl_compositor_destroy( ctx->nested.compositor );
+      ctx->nested.compositor= 0;
+   }
+
+   if ( ctx->nested.winWayland )
+   {
+      wl_egl_window_destroy( ctx->nested.winWayland );
+      ctx->nested.winWayland= 0;
+   }
+
+   if ( registry )
+   {
+      wl_registry_destroy(registry);
+      registry= 0;
+   }
+
+   if ( ctx->master.dispWayland )
+   {
+      wl_display_terminate( ctx->master.dispWayland );
+   }
+
+   if ( dispWayland )
+   {
+      wl_display_roundtrip( dispWayland );
+      wl_display_disconnect( dispWayland );
+      dispWayland= 0;
+   }
+
+   return NULL;
+}
+
+static void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
 {
    int rc;
    void *nativeWindow= 0;
@@ -1210,7 +1624,7 @@ void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
 
             eglSwapInterval( eglCtx->eglDisplay, 1 );
 
-            if ( !initGL( ctx ) )
+            if ( !initGL( &ctx->master ) )
             {
                printf("Error: measureWaylandEGL: initGL failed\n");
             }
@@ -1226,18 +1640,19 @@ void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
       }
    }
 
-   pthread_mutex_lock( &ctx->mutexReady );
+   ctx->client.upstreamDisplayName= ctx->displayName;
+   pthread_mutex_lock( &ctx->client.mutexReady );
    rc= pthread_create( &ctx->clientThreadId, NULL, waylandClientThread, ctx );
    if ( !rc )
    {
-      pthread_cond_wait( &ctx->condReady, &ctx->mutexReady );
-      pthread_mutex_unlock( &ctx->mutexReady );
+      pthread_cond_wait( &ctx->client.condReady, &ctx->client.mutexReady );
+      pthread_mutex_unlock( &ctx->client.mutexReady );
 
-      wl_display_run( ctx->dispWayland );
+      wl_display_run( ctx->master.dispWayland );
    }
    else
    {
-      pthread_mutex_unlock( &ctx->mutexReady );
+      pthread_mutex_unlock( &ctx->client.mutexReady );
    }
 
    if ( ctx->renderWayland )
@@ -1246,7 +1661,7 @@ void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
 
       if ( eglCtx->eglSurface != EGL_NO_SURFACE )
       {
-         termGL( ctx );
+         termGL( &ctx->master );
 
          eglDestroySurface( eglCtx->eglDisplay, eglCtx->eglSurface );
          eglCtx->eglSurface= EGL_NO_SURFACE;
@@ -1259,7 +1674,7 @@ void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
    }
 }
 
-void measureDirectEGL( AppCtx *ctx, EGLCtx *eglCtx )
+static void measureDirectEGL( AppCtx *ctx, EGLCtx *eglCtx )
 {
    void *nativeWindow= 0;
    long long time1, time2, diff;
@@ -1329,6 +1744,256 @@ void measureDirectEGL( AppCtx *ctx, EGLCtx *eglCtx )
    }
 }
 
+static void measureWaylandNested( AppCtx *ctx, EGLCtx *eglCtx )
+{
+   int rc;
+   void *nativeWindow= 0;
+
+   if ( ctx->renderWayland )
+   {
+      nativeWindow= PlatformCreateNativeWindow( ctx->platformCtx, ctx->windowWidth, ctx->windowHeight );
+      if ( nativeWindow )
+      {
+         eglCtx->eglSurface= eglCreateWindowSurface( eglCtx->eglDisplay,
+                                                     eglCtx->eglConfig,
+                                                     (EGLNativeWindowType)nativeWindow,
+                                                     NULL );
+         if ( eglCtx->eglSurface != EGL_NO_SURFACE )
+         {
+            eglMakeCurrent( eglCtx->eglDisplay, eglCtx->eglSurface, eglCtx->eglSurface, eglCtx->eglContext );
+
+            eglSwapInterval( eglCtx->eglDisplay, 1 );
+
+            if ( !initGL( &ctx->master ) )
+            {
+               printf("Error: measureWaylandNested: initGL failed\n");
+            }
+         }
+         else
+         {
+            printf("Error: measureWaylandNested: failed to create EGL surface\n");
+         }
+      }
+      else
+      {
+         printf("Error: measureWaylandNested: failed to create native window\n");
+      }
+   }
+
+   pthread_mutex_lock( &ctx->nested.mutexReady );
+   rc= pthread_create( &ctx->nestedThreadId, NULL, waylandNestedThread, ctx );
+   if ( !rc )
+   {
+      pthread_cond_wait( &ctx->nested.condReady, &ctx->nested.mutexReady );
+      pthread_mutex_unlock( &ctx->nested.mutexReady );
+
+      wl_display_run( ctx->master.dispWayland );
+   }
+   else
+   {
+      pthread_mutex_unlock( &ctx->nested.mutexReady );
+   }
+
+   if ( ctx->renderWayland )
+   {
+      eglMakeCurrent( eglCtx->eglDisplay, EGL_NO_CONTEXT, EGL_NO_SURFACE, EGL_NO_SURFACE );
+
+      if ( eglCtx->eglSurface != EGL_NO_SURFACE )
+      {
+         termGL( &ctx->master );
+
+         eglDestroySurface( eglCtx->eglDisplay, eglCtx->eglSurface );
+         eglCtx->eglSurface= EGL_NO_SURFACE;
+      }
+
+      if ( nativeWindow )
+      {
+         PlatformDestroyNativeWindow( ctx->platformCtx, nativeWindow );
+      }
+   }
+}
+
+static void* waylandMultiThread( void *arg )
+{
+   MultiComp *comp= (MultiComp*)arg;
+   AppCtx *ctx= comp->appCtx;
+   bool result;
+
+   comp->started= true;
+
+   printf("multi %d thread started\n", comp->index);
+
+   comp->ctx.appCtx= ctx;
+   comp->ctx.eglServer.appCtx= ctx;
+   comp->ctx.eglServer.useWayland= false;
+   comp->ctx.eglServer.nativeDisplay= PlatformGetEGLDisplayType( ctx->platformCtx );
+   if ( !initEGL( &comp->ctx.eglServer ) )
+   {
+      printf("Error: waylandMultiThread %d failed to setup EGL\n", comp->index);
+      comp->error= true;
+   }
+
+   pthread_mutex_lock( &comp->mutexReady );
+   pthread_mutex_lock( &comp->mutexStart );
+   printf("multi %d thread signal ready\n", comp->index);
+   pthread_cond_signal( &comp->condReady );
+   pthread_mutex_unlock( &comp->mutexReady );
+
+   printf("multi %d thread wait start\n", comp->index);
+   pthread_cond_wait( &comp->condStart, &comp->mutexStart );
+   pthread_mutex_unlock( &comp->mutexStart );
+
+   if ( !comp->error )
+   {
+      result= initWayland( &comp->ctx, (const char*)comp->displayName );
+      if ( result )
+      {
+         printf("multi %d display created and bound\n", comp->index);
+         comp->init= true;
+      }
+      else
+      {
+         comp->error= true;
+      }
+   }
+
+   pthread_mutex_lock( &comp->mutexReady );
+   pthread_mutex_lock( &comp->mutexStart );
+   printf("multi %d thread signal ready\n", comp->index);
+   pthread_cond_signal( &comp->condReady );
+   pthread_mutex_unlock( &comp->mutexReady );
+
+   printf("multi %d thread wait start\n", comp->index);
+   pthread_cond_wait( &comp->condStart, &comp->mutexStart );
+   pthread_mutex_unlock( &comp->mutexStart );
+
+   termWayland( &comp->ctx );
+   printf("multi %d display unbound and destroyed\n", comp->index);
+   comp->term= true;
+
+   termEGL( &comp->ctx.eglServer );
+
+   pthread_mutex_lock( &comp->mutexReady );
+   printf("multi %d thread signal ready\n", comp->index);
+   pthread_cond_signal( &comp->condReady );
+   pthread_mutex_unlock( &comp->mutexReady );
+
+   return NULL;
+}
+
+#define NUM_COMP (4)
+static void testMultipleCompositorsPerProcess( AppCtx *ctx )
+{
+   MultiComp comp[NUM_COMP];
+   int i, rc, multiCount;
+
+   for( i= 0; i < NUM_COMP; ++i )
+   {
+      memset( &comp[i], 0, sizeof(MultiComp) );
+
+      comp[i].appCtx= ctx;
+      comp[i].index= i;
+      pthread_mutex_init( &comp[i].mutexReady, 0 );
+      pthread_cond_init( &comp[i].condReady, 0 );
+      pthread_mutex_init( &comp[i].mutexStart, 0 );
+      pthread_cond_init( &comp[i].condStart, 0 );
+
+      sprintf( comp[i].displayName, "waymetric-multi%d", i );
+
+      pthread_mutex_lock( &comp[i].mutexReady );
+      rc= pthread_create( &comp[i].threadId, NULL, waylandMultiThread, &comp[i] );
+      if ( !rc )
+      {
+         printf("control wait for %d ready\n", i);
+         pthread_cond_wait( &comp[i].condReady, &comp[i].mutexReady );
+      }
+      else
+      {
+         printf("Error: testMultipleCompositorsPerProcess: failed to start test thread for instance %d\n", i);
+      }
+      pthread_mutex_unlock( &comp[i].mutexReady );
+   }
+
+   for( i= 0; i < NUM_COMP; ++i )
+   {
+      if ( comp[i].started )
+      {
+         // signal to create and bind display
+         pthread_mutex_lock( &comp[i].mutexStart );
+         printf("control signal for %d start\n", i);
+         pthread_cond_signal( &comp[i].condStart );
+         pthread_mutex_unlock( &comp[i].mutexStart );
+
+         // wait till display creation confirmed
+         pthread_mutex_lock( &comp[i].mutexReady );
+         printf("control wait for %d ready\n", i);
+         pthread_cond_wait( &comp[i].condReady, &comp[i].mutexReady );
+         pthread_mutex_unlock( &comp[i].mutexReady );
+      }
+   }
+
+   for( i= 0; i < NUM_COMP; ++i )
+   {
+      if ( comp[i].started )
+      {
+         // signal to unbind and destroy display
+         pthread_mutex_lock( &comp[i].mutexStart );
+         printf("control signal for %d start\n", i);
+         pthread_cond_signal( &comp[i].condStart );
+         pthread_mutex_unlock( &comp[i].mutexStart );
+
+         // wait till display destruction confirmed
+         pthread_mutex_lock( &comp[i].mutexReady );
+         printf("control wait for %d ready\n", i);
+         pthread_cond_wait( &comp[i].condReady, &comp[i].mutexReady );
+         pthread_mutex_unlock( &comp[i].mutexReady );
+      }
+   }
+
+   multiCount= 0;
+   for( i= 0; i < NUM_COMP; ++i )
+   {
+      if ( comp[i].started &&
+           comp[i].init &&
+           comp[i].term &&
+           !comp[i].error )
+      {
+         multiCount += 1;
+      }
+   }
+   fprintf(ctx->pReport, "Successful multiple compositor instances: %d out of %d\n", multiCount, NUM_COMP);
+}
+
+static void checkForRepeaterSupport( AppCtx *ctx )
+{
+   void *module= 0;
+
+   module= dlopen( "libwayland-egl.so.0", RTLD_NOW );
+   if ( !module )
+   {
+      module= dlopen( "libwayland-egl.so.1", RTLD_NOW );
+      if ( !module )
+      {
+         module= dlopen( "libwayland-egl.so", RTLD_NOW );
+      }
+   }
+   if ( module )
+   {
+      ctx->remoteBegin= (PFNREMOTEBEGIN)dlsym( module, "wl_egl_remote_begin" );
+      ctx->remoteEnd= (PFNREMOTEEND)dlsym( module, "wl_egl_remote_end" );
+      ctx->remoteCloneBufferFromResource= (PFNREMOTECLONEBUFFERFROMRESOURCE)dlsym( module, "wl_egl_remote_buffer_clone" );
+
+      if ( (ctx->remoteBegin != 0) &&
+           (ctx->remoteEnd != 0) &&
+           (ctx->remoteCloneBufferFromResource != 0) )
+      {
+         ctx->canRemoteClone= true;
+      }
+
+      dlclose( module );
+   }
+}
+
 void showUsage( void )
 {
    printf("Usage:\n");
@@ -1339,6 +2004,10 @@ void showUsage( void )
    printf("--iterations <count>\n");
    printf("--no-direct\n");
    printf("--no-wayland\n");
+   printf("--no-multi\n");
+   printf("--no-normal\n");
+   printf("--no-nested\n");
+   printf("--no-repeater\n");
    printf("--no-wayland-render\n");
    printf("-? : show usage\n");
    printf("\n");
@@ -1352,12 +2021,16 @@ int main( int argc, const char **argv )
    const char *s;
    bool noDirect= false;
    bool noWayland= false;
+   bool noNormal= false;
+   bool noMulti= false;
+   bool noNested= false;
+   bool noRepeater= false;
    bool noWaylandRender= false;
    const char *reportFilename= 0;
    int pacingInc, step, maxStep;
    long long directTotal, waylandTotal;
 
-   printf("waymetric v0.41\n");
+   printf("waymetric v%s\n", WAYMETRIC_VERSION);
 
    ctx= (AppCtx*)calloc( 1, sizeof(AppCtx) );
    if ( !ctx )
@@ -1366,9 +2039,17 @@ int main( int argc, const char **argv )
       goto exit;
    }
    pthread_mutex_init( &ctx->mutex, 0 );
-   pthread_mutex_init( &ctx->mutexReady, 0 );
-   pthread_cond_init( &ctx->condReady, 0 );
+   pthread_mutex_init( &ctx->master.mutex, 0 );
+   pthread_mutex_init( &ctx->master.mutexReady, 0 );
+   pthread_cond_init( &ctx->master.condReady, 0 );
+   pthread_mutex_init( &ctx->nested.mutex, 0 );
+   pthread_mutex_init( &ctx->nested.mutexReady, 0 );
+   pthread_cond_init( &ctx->nested.condReady, 0 );
+   pthread_mutex_init( &ctx->client.mutex, 0 );
+   pthread_mutex_init( &ctx->client.mutexReady, 0 );
+   pthread_cond_init( &ctx->client.condReady, 0 );
    ctx->displayName= "waymetric0";
+   ctx->nestedDisplayName= "waymetric-nested0";
    ctx->maxIterations= DEFAULT_ITERATIONS;
    ctx->windowWidth= DEFAULT_WIDTH;
    ctx->windowHeight= DEFAULT_HEIGHT;
@@ -1413,6 +2094,18 @@ int main( int argc, const char **argv )
          {
             noWayland= true;
          }
+         else if ( (len == 11) && !strncmp( argv[argidx], "--no-normal", len) )
+         {
+            noNormal= true;
+         }
+         else if ( (len == 10) && !strncmp( argv[argidx], "--no-multi", len) )
+         {
+            noMulti= true;
+         }
+         else if ( (len == 11) && !strncmp( argv[argidx], "--no-nested", len) )
+         {
+            noNested= true;
+         }
          else if ( (len == 19) && !strncmp( argv[argidx], "--no-wayland-render", len) )
          {
             noWaylandRender= true;
@@ -1435,6 +2128,8 @@ int main( int argc, const char **argv )
 
    ctx->pReport= fopen( reportFilename, "wt");
 
+   setenv( "XDG_RUNTIME_DIR", "/tmp", true );
+
    ctx->platformCtx= PlatfromInit();
    if ( !ctx->platformCtx )
    {
@@ -1442,34 +2137,38 @@ int main( int argc, const char **argv )
       goto exit;
    }
 
-   ctx->eglServer.appCtx= ctx;
-   ctx->eglClient.appCtx= ctx;
+   ctx->master.appCtx= ctx;
+   ctx->nested.appCtx= ctx;
+   ctx->client.appCtx= ctx;
+   ctx->master.eglServer.appCtx= ctx;
+   ctx->nested.eglServer.appCtx= ctx;
+   ctx->client.eglClient.appCtx= ctx;
 
-   ctx->eglServer.useWayland= false;
-   ctx->eglServer.nativeDisplay= PlatformGetEGLDisplayType( ctx->platformCtx );
-   if ( !initEGL( &ctx->eglServer ) )
+   ctx->master.eglServer.useWayland= false;
+   ctx->master.eglServer.nativeDisplay= PlatformGetEGLDisplayType( ctx->platformCtx );
+   if ( !initEGL( &ctx->master.eglServer ) )
    {
       printf("Error: failed to setup EGL\n");
       goto exit;
    }
 
    // Check for extensions
-   s= eglQueryString( ctx->eglServer.eglDisplay, EGL_VENDOR );
+   s= eglQueryString( ctx->master.eglServer.eglDisplay, EGL_VENDOR );
    if ( s )
    {
       ctx->eglVendor= strdup(s);
    }
-   s= eglQueryString( ctx->eglServer.eglDisplay, EGL_VERSION );
+   s= eglQueryString( ctx->master.eglServer.eglDisplay, EGL_VERSION );
    if ( s )
    {
       ctx->eglVersion= strdup(s);
    }
-   s= eglQueryString( ctx->eglServer.eglDisplay, EGL_CLIENT_APIS );
+   s= eglQueryString( ctx->master.eglServer.eglDisplay, EGL_CLIENT_APIS );
    if ( s )
    {
       ctx->eglClientAPIS= strdup(s);
    }
-   s= eglQueryString( ctx->eglServer.eglDisplay, EGL_EXTENSIONS );
+   s= eglQueryString( ctx->master.eglServer.eglDisplay, EGL_EXTENSIONS );
    if ( s )
    {
       ctx->eglExtensions= strdup(s);
@@ -1493,7 +2192,7 @@ int main( int argc, const char **argv )
       ctx->haveWaylandEGL= true;
    }
 
-   fprintf(ctx->pReport, "waymetric v0.41\n");
+   fprintf(ctx->pReport, "waymetric v%s\n", WAYMETRIC_VERSION);
    fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
    fprintf(ctx->pReport, "Have wayland-egl: %d\n", ctx->haveWaylandEGL );
    fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
@@ -1510,9 +2209,43 @@ int main( int argc, const char **argv )
    fprintf(ctx->pReport, "glEGLImageTargetTexture2DOES: %s\n", ctx->glEGLImageTargetTexture2DOES ? "true" : "false");
    fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
 
+   if ( !noWayland && ctx->haveWaylandEGL && !noMulti )
+   {
+      fprintf(ctx->pReport, "\n");
+      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
+      fprintf(ctx->pReport, "Testing multiple compositor instances per process...\n");
+      printf("\nTesting multiple compositor instances per process...\n");
+      testMultipleCompositorsPerProcess( ctx );
+      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
+
+      // Tear down EGL and platform and re-init to have a clean start after multi-test
+      termEGL( &ctx->master.eglServer );
+
+      if ( ctx->platformCtx )
+      {
+         PlatformTerm( ctx->platformCtx );
+         ctx->platformCtx= 0;
+      }
+
+      ctx->platformCtx= PlatfromInit();
+      if ( !ctx->platformCtx )
+      {
+         printf("ErrorL WayMetPlatformInit failed\n");
+         goto exit;
+      }
+
+      ctx->master.eglServer.useWayland= false;
+      ctx->master.eglServer.nativeDisplay= PlatformGetEGLDisplayType( ctx->platformCtx );
+      if ( !initEGL( &ctx->master.eglServer ) )
+      {
+         printf("Error: failed to setup EGL\n");
+         goto exit;
+      }
+   }
+
    if ( !noWayland && ctx->haveWaylandEGL )
    { 
-      if ( !initWayland( ctx ) )
+      if ( !initWayland( &ctx->master, ctx->displayName ) )
       {
          printf("Error: initWayland failed\n");
          goto exit;
@@ -1540,7 +2273,7 @@ int main( int argc, const char **argv )
 
          ctx->directEGLIterationCount= 0;
          ctx->directEGLTimeTotal= 0;
-         measureDirectEGL( ctx, &ctx->eglServer );
+         measureDirectEGL( ctx, &ctx->master.eglServer );
 
          fprintf(ctx->pReport, "Iterations: %d Total time (us): %lld  FPS: %f\n", 
                  ctx->directEGLIterationCount, ctx->directEGLTimeTotal, ctx->directEGLFPS );
@@ -1553,20 +2286,94 @@ int main( int argc, const char **argv )
       }
    }
 
-   if ( !noWayland && ctx->haveWaylandEGL )
-   {
-      ctx->renderWayland= !noWaylandRender;
-      measureWaylandEGL( ctx, &ctx->eglServer );
-
-      waylandTotal= ctx->waylandTotal;
-   }
-
-   if ( directTotal > 0 )
+   if ( !noWayland && !noNormal && ctx->haveWaylandEGL )
    {
       fprintf(ctx->pReport, "\n");
-      fprintf(ctx->pReport, "=================================================================\n");
-      fprintf(ctx->pReport, "waymetric speed index: %f\n", ((double)waylandTotal / (double)directTotal) );
-      fprintf(ctx->pReport, "=================================================================\n");
+      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
+      fprintf(ctx->pReport, "Measuring Wayland...\n");
+      printf("\nMeasuring Wayland...\n");
+
+      ctx->renderWayland= !noWaylandRender;
+      measureWaylandEGL( ctx, &ctx->master.eglServer );
+
+      waylandTotal= ctx->waylandTotal;
+
+      if ( waylandTotal == 0 )
+      {
+         fprintf(ctx->pReport, "Wayland failed\n");
+         printf("\nWayland failed\n");
+      }
+      else
+      if ( directTotal > 0 )
+      {
+         fprintf(ctx->pReport, "\n");
+         fprintf(ctx->pReport, "=================================================================\n");
+         fprintf(ctx->pReport, "waymetric speed index: %f\n", ((double)waylandTotal / (double)directTotal) );
+         fprintf(ctx->pReport, "=================================================================\n");
+      }
+   }
+
+   if ( !noWayland && !noNested && ctx->haveWaylandEGL )
+   {
+      fprintf(ctx->pReport, "\n");
+      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
+      fprintf(ctx->pReport, "Measuring Wayland Nested...\n");
+      printf("\nMeasuring Wayland Nested...\n");
+
+      ctx->waylandTotal= 0;
+      ctx->renderWayland= !noWaylandRender;
+      measureWaylandNested( ctx, &ctx->master.eglServer );
+
+      waylandTotal= ctx->waylandTotal;
+
+      if ( waylandTotal == 0 )
+      {
+         fprintf(ctx->pReport, "Wayland Nested failed\n");
+         printf("\nWayland Nested failed\n");
+      }
+      else
+      if ( directTotal > 0 )
+      {
+         fprintf(ctx->pReport, "\n");
+         fprintf(ctx->pReport, "=================================================================\n");
+         fprintf(ctx->pReport, "waymetric nested speed index: %f\n", ((double)waylandTotal / (double)directTotal) );
+         fprintf(ctx->pReport, "=================================================================\n");
+      }
+   }
+
+   if ( !noWayland && !noRepeater && ctx->haveWaylandEGL )
+   {
+      fprintf(ctx->pReport, "-----------------------------------------------------------------\n");
+      fprintf(ctx->pReport, "Checking for repeater support...\n");
+      printf("Checking for repeater support...\n");
+      checkForRepeaterSupport( ctx );
+      fprintf(ctx->pReport, "Repeater support: %s\n", ctx->canRemoteClone ? "yes" : "no" );
+      printf("Repeater support: %s\n", ctx->canRemoteClone ? "yes" : "no" );
+      if ( ctx->canRemoteClone )
+      {
+         fprintf(ctx->pReport, "Measuring Wayland Repeating...\n");
+         printf("\nMeasuring Wayland Repeating...\n");
+
+         ctx->waylandTotal= 0;
+         ctx->renderWayland= !noWaylandRender;
+         measureWaylandNested( ctx, &ctx->master.eglServer );
+
+         waylandTotal= ctx->waylandTotal;
+
+         if ( waylandTotal == 0 )
+         {
+            fprintf(ctx->pReport, "Wayland Repeating failed\n");
+            printf("\nWayland Repeating failed\n");
+         }
+         else
+         if ( directTotal > 0 )
+         {
+            fprintf(ctx->pReport, "\n");
+            fprintf(ctx->pReport, "=================================================================\n");
+            fprintf(ctx->pReport, "waymetric repeater speed index: %f\n", ((double)waylandTotal / (double)directTotal) );
+            fprintf(ctx->pReport, "=================================================================\n");
+         }
+      }
    }
 
    printf("\n");
@@ -1576,14 +2383,16 @@ int main( int argc, const char **argv )
 
 exit:
 
+   unsetenv( "XDG_RUNTIME_DIR" );
+
    if ( ctx )
    {
       if ( !noWayland && ctx->haveWaylandEGL )
       {
-         termWayland( ctx );
+         termWayland( &ctx->master );
       }
 
-      termEGL( &ctx->eglServer );
+      termEGL( &ctx->master.eglServer );
 
       if ( ctx->platformCtx )
       {
@@ -1615,8 +2424,15 @@ exit:
          ctx->eglExtensions= 0;
       }
 
-      pthread_cond_destroy( &ctx->condReady );
-      pthread_mutex_destroy( &ctx->mutexReady );
+      pthread_mutex_destroy( &ctx->client.mutex );
+      pthread_cond_destroy( &ctx->client.condReady );
+      pthread_mutex_destroy( &ctx->client.mutexReady );
+      pthread_mutex_destroy( &ctx->nested.mutex );
+      pthread_cond_destroy( &ctx->nested.condReady );
+      pthread_mutex_destroy( &ctx->nested.mutexReady );
+      pthread_mutex_destroy( &ctx->master.mutex );
+      pthread_cond_destroy( &ctx->master.condReady );
+      pthread_mutex_destroy( &ctx->master.mutexReady );
       pthread_mutex_destroy( &ctx->mutex );
 
       if ( ctx->pReport )

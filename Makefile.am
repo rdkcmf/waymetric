@@ -34,7 +34,7 @@ waymetric_SOURCES = waymetric.cpp \
 waymetric_CXXFLAGS = $(AM_CXXFLAGS)
 waymetric_LDFLAGS = \
    $(AM_LDFLAGS) \
-   -lwayland-egl -lwayland-client -lEGL -lGLESv2 -lpthread
+   -lwayland-egl -lwayland-client -lEGL -lGLESv2 -lpthread -ldl
 
 distcleancheck_listfiles = *-libtool
 
