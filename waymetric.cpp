@@ -38,9 +38,11 @@
 
 #include <vector>
 
-#define WAYMETRIC_VERSION "0.50"
+#define WAYMETRIC_VERSION "0.60"
 
 #define UNUSED(x) ((void)x)
+
+#define MIN(x,y) (((x) < (y)) ? (x) : (y))
 
 #define DEFAULT_WIDTH (1280)
 #define DEFAULT_HEIGHT (720)
@@ -233,6 +235,45 @@ static long long getCurrentTimeMillis(void)
    utcCurrentTimeMillis= tv.tv_sec*1000LL+(tv.tv_usec/1000LL);
 
    return utcCurrentTimeMillis;
+}
+
+#define RESULT_FILE "/tmp/waymetric-result"
+#define RESULT_FORMAT "result: %lld\n"
+
+static void writeResult( long long value )
+{
+   FILE *pFile= 0;
+   pFile= fopen( RESULT_FILE, "wt");
+   if ( pFile )
+   {
+      fprintf( pFile, RESULT_FORMAT, value );
+      fclose( pFile );
+   }
+   else
+   {
+      printf("Error: unable to open result file: %s\n", RESULT_FILE);
+   }
+}
+
+static long long readResult()
+{
+   long long value= 0;
+   FILE *pFile= 0;
+   pFile= fopen( RESULT_FILE, "rt");
+   if ( pFile )
+   {
+      if ( fscanf( pFile, RESULT_FORMAT, &value ) != 1 )
+      {
+         printf("Error: unable to parse result from %s\n" RESULT_FILE);
+      }
+      fclose( pFile );
+      remove( RESULT_FILE );
+   }
+   else
+   {
+      printf("Error: unable to open result file: %s\n", RESULT_FILE);
+   }
+   return value;
 }
 
 #define MAX_ATTRIBS (24)
@@ -595,10 +636,10 @@ void drawGL( EGLCtx *eglCtx, Surface *surface )
  
    const float uv[4][2]=
    {
-      { 0,  1 },
-      { 1,  1 },
       { 0,  0 },
-      { 1,  0 }
+      { 1,  0 },
+      { 0,  1 },
+      { 1,  1 }
    };
 
    const float identityMatrix[4][4]=
@@ -687,6 +728,8 @@ static void surfaceDestroy(struct wl_client *client, struct wl_resource *resourc
       wl_display_flush( surface->ctx->upstreamDisplay );
       surface->surfaceNested= 0;
    }
+   // terminate display to end test
+   wl_display_terminate( wl_client_get_display(client) );
    wl_resource_destroy(resource);
 }
 
@@ -948,6 +991,13 @@ static void surfaceSetBufferScale(struct wl_client *, struct wl_resource *, int3
    // ignore
 }
 
+#if ( (WAYLAND_VERSION_MAJOR >= 1) && (WAYLAND_VERSION_MINOR >= 18) )
+static void surfaceDamageBuffer(struct wl_client *, struct wl_resource *, int32_t, int32_t, int32_t, int32_t)
+{
+   // ignore
+}
+#endif
+
 static const struct wl_surface_interface surface_interface= 
 {
    surfaceDestroy,
@@ -958,7 +1008,10 @@ static const struct wl_surface_interface surface_interface=
    surfaceSetInputRegion,
    surfaceCommit,
    surfaceSetBufferTransform,
-   surfaceSetBufferScale
+   surfaceSetBufferScale,
+   #if ( (WAYLAND_VERSION_MAJOR >= 1) && (WAYLAND_VERSION_MINOR >= 18) )
+   surfaceDamageBuffer
+   #endif
 };
 
 static void attachedBufferDestroyCallback(struct wl_listener *listener, void *data )
@@ -1026,7 +1079,7 @@ static void compositorCreateSurface( struct wl_client *client, struct wl_resourc
    surface->attachedBufferDestroyListener.notify= attachedBufferDestroyCallback;
    surface->detachedBufferDestroyListener.notify= detachedBufferDestroyCallback;
 
-   surface->resource= wl_resource_create(client, &wl_surface_interface, wl_resource_get_version(resource), id);
+   surface->resource= wl_resource_create(client, &wl_surface_interface, MIN(3,wl_resource_get_version(resource)), id);
    if (!surface->resource)
    {
       free(surface);
@@ -1069,7 +1122,7 @@ static void compositorBind( struct wl_client *client, void *data, uint32_t versi
    WaylandCtx *ctx= (WaylandCtx*)data;
    struct wl_resource *resource;
 
-   resource= wl_resource_create(client, &wl_compositor_interface, version, id);
+   resource= wl_resource_create(client, &wl_compositor_interface, MIN(3,version), id);
    if (!resource)
    {
       wl_client_post_no_memory(client);
@@ -1160,25 +1213,24 @@ static const struct wl_registry_listener registryListener=
 };
 } // namespace waylandClient
 
-static void* waylandClientThread( void *arg )
+static void waylandClientRole( AppCtx *ctx )
 {
    using namespace waylandClient;
 
-   AppCtx *ctx= (AppCtx*)arg;
    struct wl_display *dispWayland= 0;
    struct wl_registry *registry= 0;
    long long time1, time2, diff;
    GLfloat r, g, b, t;
    int rc, pacingInc, step, maxStep;
+   const char *s;
+   
 
-   pthread_mutex_lock( &ctx->client.mutexReady );
-   pthread_cond_signal( &ctx->client.condReady );
-   pthread_mutex_unlock( &ctx->client.mutexReady );
+   usleep(100000);
 
    dispWayland= wl_display_connect( ctx->client.upstreamDisplayName );
    if ( !dispWayland )
    {
-      printf("Error: waylandClientThread: failed to connect to display\n");
+      printf("Error: roleWaylandClient: failed to connect to display\n");
       goto exit;
    }
    ctx->client.upstreamDisplay= dispWayland;
@@ -1186,7 +1238,7 @@ static void* waylandClientThread( void *arg )
    registry= wl_display_get_registry(dispWayland);
    if ( !registry )
    {
-      printf("Error: waylandClientThread: failed tp get wayland registry\n");
+      printf("Error: roleWaylandClient: failed tp get wayland registry\n");
       goto exit;
    }
 
@@ -1196,7 +1248,7 @@ static void* waylandClientThread( void *arg )
 
    if ( !ctx->client.compositor )
    {
-      printf("Error: waylandClientThread: failed to obtain wayland compositor\n");
+      printf("Error: roleWaylandClient: failed to obtain wayland compositor\n");
       goto exit;
    }
 
@@ -1204,21 +1256,27 @@ static void* waylandClientThread( void *arg )
    ctx->client.eglClient.dispWayland= dispWayland;
    if ( !initEGL( &ctx->client.eglClient ) )
    {
-      printf("Error: waylandClientThread: failed to setup EGL\n");
+      printf("Error: roleWaylandClient: failed to setup EGL\n");
       goto exit;
+   }
+
+   s= eglQueryString( ctx->client.eglClient.eglDisplay, EGL_VENDOR );
+   if ( s )
+   {
+      ctx->eglVendor= strdup(s);
    }
 
    ctx->client.surface= wl_compositor_create_surface(ctx->client.compositor);
    if ( !ctx->client.surface )
    {
-      printf("Error: waylandClientThread: failed to create wayland surface\n");
+      printf("Error: roleWaylandClient: failed to create wayland surface\n");
       goto exit;
    }
 
    ctx->client.winWayland= wl_egl_window_create(ctx->client.surface, ctx->windowWidth, ctx->windowHeight);
    if ( !ctx->client.winWayland )
    {
-      printf("Error: waylandClientThread: failed to create wayland window\n");
+      printf("Error: roleWaylandClient: failed to create wayland window\n");
       goto exit;
    }
 
@@ -1228,7 +1286,7 @@ static void* waylandClientThread( void *arg )
                                                       NULL );
    if ( ctx->client.eglClient.eglSurface == EGL_NO_SURFACE )
    {
-      printf("Error: waylandClientThread: failed to create EGL surface\n");
+      printf("Error: roleWaylandClient: failed to create EGL surface\n");
       goto exit;
    }
 
@@ -1297,6 +1355,7 @@ static void* waylandClientThread( void *arg )
    usleep( 1500000 );
 
 exit:
+   writeResult( ctx->waylandTotal );
 
    if ( ctx->client.surface )
    {
@@ -1345,10 +1404,38 @@ exit:
 
    if ( dispWayland )
    {
-      wl_display_roundtrip( dispWayland );
+      wl_display_flush( dispWayland );
+      usleep(100000);
       wl_display_disconnect( dispWayland );
       dispWayland= 0;
    }
+}
+
+static void* waylandClientThread( void *arg )
+{
+   using namespace waylandClient;
+
+   AppCtx *ctx= (AppCtx*)arg;
+   char work[256];
+
+   fflush( ctx->pReport );
+
+   sprintf(work,"waymetric --iterations %d", ctx->maxIterations );
+   if ( ctx->client.upstreamDisplayName == ctx->nestedDisplayName )
+   {
+      strcat( work, " --role-wayland-client-nested" );
+   }
+   else
+   {
+      strcat( work, " --role-wayland-client" );
+   }
+   if ( !ctx->renderWayland )
+   {
+      strcat( work, " --no-wayland-render" );
+   }
+   system(work);
+
+   fseek( ctx->pReport, 0LL, SEEK_END );
 
    return NULL;
 }
@@ -1425,24 +1512,19 @@ static int nestedDisplayTimeOut( void *data )
    return 0;
 }
 
-static void* waylandNestedThread( void *arg )
+static void waylandNestedRole( AppCtx *ctx )
 {
    using namespace waylandNested;
 
-   AppCtx *ctx= (AppCtx*)arg;
    struct wl_display *dispWayland= 0;
    struct wl_registry *registry= 0;
    int rc;
 
-   pthread_mutex_lock( &ctx->nested.mutexReady );
-   pthread_cond_signal( &ctx->nested.condReady );
-   pthread_mutex_unlock( &ctx->nested.mutexReady );
-
    dispWayland= wl_display_connect( ctx->displayName );
-   printf("waylandNestedThread: dispWayland %p from name %s\n", dispWayland, ctx->displayName);
+   printf("waylandNestedRole: dispWayland %p from name %s\n", dispWayland, ctx->displayName);
    if ( !dispWayland )
    {
-      printf("Error: waylandNestedThread: failed to connect to display\n");
+      printf("Error: waylandNestedRole: failed to connect to display\n");
       goto exit;
    }
    ctx->nested.upstreamDisplay= dispWayland;
@@ -1450,7 +1532,7 @@ static void* waylandNestedThread( void *arg )
    registry= wl_display_get_registry(dispWayland);
    if ( !registry )
    {
-      printf("Error: waylandNestedThread: failed tp get wayland registry\n");
+      printf("Error: waylandNestedRole: failed tp get wayland registry\n");
       goto exit;
    }
 
@@ -1460,7 +1542,7 @@ static void* waylandNestedThread( void *arg )
 
    if ( !ctx->nested.compositor )
    {
-      printf("Error: waylandNestedThread: failed to obtain wayland compositor\n");
+      printf("Error: waylandNestedRole: failed to obtain wayland compositor\n");
       goto exit;
    }
 
@@ -1468,21 +1550,21 @@ static void* waylandNestedThread( void *arg )
    ctx->nested.eglServer.dispWayland= dispWayland;
    if ( !initEGL( &ctx->nested.eglServer ) )
    {
-      printf("Error: waylandNestedThread: failed to setup EGL\n");
+      printf("Error: waylandNestedRole: failed to setup EGL\n");
       goto exit;
    }
 
    ctx->nested.surface= wl_compositor_create_surface(ctx->nested.compositor);
    if ( !ctx->nested.surface )
    {
-      printf("Error: waylandNestedThread: failed to create wayland surface\n");
+      printf("Error: waylandNestedRole: failed to create wayland surface\n");
       goto exit;
    }
 
    ctx->nested.winWayland= wl_egl_window_create(ctx->nested.surface, ctx->windowWidth, ctx->windowHeight);
    if ( !ctx->nested.winWayland )
    {
-      printf("Error: waylandNestedThread: failed to create wayland window\n");
+      printf("Error: waylandNestedRole: failed to create wayland window\n");
       goto exit;
    }
 
@@ -1492,7 +1574,7 @@ static void* waylandNestedThread( void *arg )
                                                       NULL );
    if ( ctx->nested.eglServer.eglSurface == EGL_NO_SURFACE )
    {
-      printf("Error: waylandNestedThread: failed to create EGL surface\n");
+      printf("Error: waylandNestedRole: failed to create EGL surface\n");
       goto exit;
    }
 
@@ -1503,12 +1585,12 @@ static void* waylandNestedThread( void *arg )
 
    if ( !initGL( &ctx->nested ) )
    {
-      printf("Error: waylandNestedThread: initGL failed\n");
+      printf("Error: waylandNestedRole: initGL failed\n");
    }
 
    if ( !initWayland( &ctx->nested, ctx->nestedDisplayName ) )
    {
-      printf("Error: waylandNestedThread: initWayland failed\n");
+      printf("Error: waylandNestedRole: initWayland failed\n");
       goto exit;
    }
 
@@ -1516,7 +1598,7 @@ static void* waylandNestedThread( void *arg )
    {
       if ( !ctx->remoteBegin( ctx->nested.dispWayland, dispWayland ) )
       {
-         printf("Error: waylandNestedThread: remoteBegin failure\n");
+         printf("Error: waylandNestedRole: remoteBegin failure\n");
          ctx->canRemoteClone= false;
          goto exit;
       }
@@ -1527,24 +1609,18 @@ static void* waylandNestedThread( void *arg )
       rc= pthread_create( &ctx->nestedDispatchThreadId, NULL, waylandNestedDispatchThread, ctx );
       if ( rc )
       {
-         printf("Error: waylandNestedThread: failed to start nested dispatch thread\n");
+         printf("Error: waylandNestedRole: failed to start nested dispatch thread\n");
       }
       ctx->nested.isRepeater= true;
    }
 
    ctx->client.upstreamDisplayName= ctx->nestedDisplayName;
-   pthread_mutex_lock( &ctx->client.mutexReady );
    rc= pthread_create( &ctx->clientThreadId, NULL, waylandClientThread, ctx );
    if ( !rc )
    {
-      pthread_cond_wait( &ctx->client.condReady, &ctx->client.mutexReady );
-      pthread_mutex_unlock( &ctx->client.mutexReady );
-
       wl_display_run( ctx->nested.dispWayland );
-   }
-   else
-   {
-      pthread_mutex_unlock( &ctx->client.mutexReady );
+
+      pthread_join( ctx->clientThreadId, NULL );
    }
 
 exit:
@@ -1589,17 +1665,32 @@ exit:
       registry= 0;
    }
 
-   if ( ctx->master.dispWayland )
-   {
-      wl_display_terminate( ctx->master.dispWayland );
-   }
-
    if ( dispWayland )
    {
-      wl_display_roundtrip( dispWayland );
+      wl_display_flush( dispWayland );
+      usleep(100000);
       wl_display_disconnect( dispWayland );
       dispWayland= 0;
    }
+}
+
+static void* waylandNestedThread( void *arg )
+{
+   using namespace waylandNested;
+
+   AppCtx *ctx= (AppCtx*)arg;
+   char work[256];
+
+   fflush( ctx->pReport );
+
+   sprintf(work,"waymetric --role-wayland-nested --iterations %d", ctx->maxIterations );
+   if ( !ctx->renderWayland )
+   {
+      strcat( work, " --no-wayland-render" );
+   }
+   system(work);
+
+   fseek( ctx->pReport, 0LL, SEEK_END );
 
    return NULL;
 }
@@ -1641,18 +1732,13 @@ static void measureWaylandEGL( AppCtx *ctx, EGLCtx *eglCtx )
    }
 
    ctx->client.upstreamDisplayName= ctx->displayName;
-   pthread_mutex_lock( &ctx->client.mutexReady );
    rc= pthread_create( &ctx->clientThreadId, NULL, waylandClientThread, ctx );
    if ( !rc )
    {
-      pthread_cond_wait( &ctx->client.condReady, &ctx->client.mutexReady );
-      pthread_mutex_unlock( &ctx->client.mutexReady );
-
       wl_display_run( ctx->master.dispWayland );
-   }
-   else
-   {
-      pthread_mutex_unlock( &ctx->client.mutexReady );
+
+      pthread_join( ctx->clientThreadId, NULL );
+      ctx->waylandTotal= readResult();
    }
 
    if ( ctx->renderWayland )
@@ -1780,18 +1866,13 @@ static void measureWaylandNested( AppCtx *ctx, EGLCtx *eglCtx )
       }
    }
 
-   pthread_mutex_lock( &ctx->nested.mutexReady );
    rc= pthread_create( &ctx->nestedThreadId, NULL, waylandNestedThread, ctx );
    if ( !rc )
    {
-      pthread_cond_wait( &ctx->nested.condReady, &ctx->nested.mutexReady );
-      pthread_mutex_unlock( &ctx->nested.mutexReady );
-
       wl_display_run( ctx->master.dispWayland );
-   }
-   else
-   {
-      pthread_mutex_unlock( &ctx->nested.mutexReady );
+
+      pthread_join( ctx->nestedThreadId, NULL );
+      ctx->waylandTotal= readResult();
    }
 
    if ( ctx->renderWayland )
@@ -2026,6 +2107,9 @@ int main( int argc, const char **argv )
    bool noNested= false;
    bool noRepeater= false;
    bool noWaylandRender= false;
+   bool roleWaylandClient= false;
+   bool roleWaylandClientNested= false;
+   bool roleWaylandNested= false;
    const char *reportFilename= 0;
    int pacingInc, step, maxStep;
    long long directTotal, waylandTotal;
@@ -2106,9 +2190,26 @@ int main( int argc, const char **argv )
          {
             noNested= true;
          }
+         else if ( (len == 13) && !strncmp( argv[argidx], "--no-repeater", len) )
+         {
+            noRepeater= true;
+         }
          else if ( (len == 19) && !strncmp( argv[argidx], "--no-wayland-render", len) )
          {
             noWaylandRender= true;
+         }
+         else if ( (len == 21) && !strncmp( argv[argidx], "--role-wayland-client", len) )
+         {
+            roleWaylandClient= true;
+         }
+         else if ( (len == 28) && !strncmp( argv[argidx], "--role-wayland-client-nested", len) )
+         {
+            roleWaylandClient= true;
+            roleWaylandClientNested= true;
+         }
+         else if ( (len == 21) && !strncmp( argv[argidx], "--role-wayland-nested", len) )
+         {
+            roleWaylandNested= true;
          }
       }
       else
@@ -2126,16 +2227,7 @@ int main( int argc, const char **argv )
       reportFilename= "/tmp/waymetric-report.txt";
    }
 
-   ctx->pReport= fopen( reportFilename, "wt");
-
    setenv( "XDG_RUNTIME_DIR", "/tmp", true );
-
-   ctx->platformCtx= PlatfromInit();
-   if ( !ctx->platformCtx )
-   {
-      printf("ErrorL WayMetPlatformInit failed\n");
-      goto exit;
-   }
 
    ctx->master.appCtx= ctx;
    ctx->nested.appCtx= ctx;
@@ -2143,6 +2235,58 @@ int main( int argc, const char **argv )
    ctx->master.eglServer.appCtx= ctx;
    ctx->nested.eglServer.appCtx= ctx;
    ctx->client.eglClient.appCtx= ctx;
+
+   ctx->eglGetPlatformDisplayEXT= (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress( "eglGetPlatformDisplayEXT" );
+   ctx->eglBindWaylandDisplayWL= (PFNEGLBINDWAYLANDDISPLAYWL)eglGetProcAddress("eglBindWaylandDisplayWL");
+   ctx->eglUnbindWaylandDisplayWL= (PFNEGLUNBINDWAYLANDDISPLAYWL)eglGetProcAddress("eglUnbindWaylandDisplayWL");
+   ctx->eglQueryWaylandBufferWL= (PFNEGLQUERYWAYLANDBUFFERWL)eglGetProcAddress("eglQueryWaylandBufferWL");
+   ctx->eglCreateImageKHR= (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+   ctx->eglDestroyImageKHR= (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+   ctx->glEGLImageTargetTexture2DOES= (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+   if ( roleWaylandClient )
+   {
+      ctx->pReport= fopen( reportFilename, "at");
+      ctx->platformCtx= PlatfromInit();
+      if ( !ctx->platformCtx )
+      {
+         printf("Error: PlatformInit failed\n");
+      }
+      if ( roleWaylandClientNested )
+      {
+         ctx->client.upstreamDisplayName= ctx->nestedDisplayName;
+      }
+      else
+      {
+         ctx->client.upstreamDisplayName= ctx->displayName;
+      }
+      waylandClientRole( ctx );
+      nRC= 0;
+      goto exit;
+   }
+   else if ( roleWaylandNested )
+   {
+      ctx->pReport= fopen( reportFilename, "at");
+      ctx->platformCtx= PlatfromInit();
+      if ( !ctx->platformCtx )
+      {
+         printf("Error: PlatformInit failed\n");
+      }
+      ctx->renderWayland= !noWaylandRender;
+      ctx->client.upstreamDisplayName= ctx->displayName;
+      waylandNestedRole( ctx );
+      nRC= 0;
+      goto exit;
+   }
+
+   ctx->pReport= fopen( reportFilename, "wt");
+   
+   ctx->platformCtx= PlatfromInit();
+   if ( !ctx->platformCtx )
+   {
+      printf("Error: PlatformInit failed\n");
+      goto exit;
+   }
 
    ctx->master.eglServer.useWayland= false;
    ctx->master.eglServer.nativeDisplay= PlatformGetEGLDisplayType( ctx->platformCtx );
@@ -2173,13 +2317,6 @@ int main( int argc, const char **argv )
    {
       ctx->eglExtensions= strdup(s);
    }
-   ctx->eglGetPlatformDisplayEXT= (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress( "eglGetPlatformDisplayEXT" );
-   ctx->eglBindWaylandDisplayWL= (PFNEGLBINDWAYLANDDISPLAYWL)eglGetProcAddress("eglBindWaylandDisplayWL");
-   ctx->eglUnbindWaylandDisplayWL= (PFNEGLUNBINDWAYLANDDISPLAYWL)eglGetProcAddress("eglUnbindWaylandDisplayWL");
-   ctx->eglQueryWaylandBufferWL= (PFNEGLQUERYWAYLANDBUFFERWL)eglGetProcAddress("eglQueryWaylandBufferWL");
-   ctx->eglCreateImageKHR= (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
-   ctx->eglDestroyImageKHR= (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-   ctx->glEGLImageTargetTexture2DOES= (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 
    if ( strstr( ctx->eglExtensions, "EGL_WL_bind_wayland_display" ) &&
         ctx->eglBindWaylandDisplayWL &&
@@ -2230,7 +2367,7 @@ int main( int argc, const char **argv )
       ctx->platformCtx= PlatfromInit();
       if ( !ctx->platformCtx )
       {
-         printf("ErrorL WayMetPlatformInit failed\n");
+         printf("Error: WayMetPlatformInit failed\n");
          goto exit;
       }
 
