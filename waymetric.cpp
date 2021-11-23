@@ -26,6 +26,9 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#if defined (USE_MESA)
+#include <EGL/eglmesaext.h>
+#endif
 
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h> 

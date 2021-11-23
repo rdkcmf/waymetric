@@ -20,3 +20,5 @@
 DEPENDS += " libdrm mesa"
 CXXFLAGS_append = " -DUSE_PLATFORM_DRM -I${STAGING_INCDIR}/libdrm"
 LDFLAGS_append = " -ldrm -lgbm -ldl -lwayland-server"
+
+CXXFLAGS_append_dunfell = " ${@bb.utils.contains('MACHINE_FEATURES', 'vc4graphics', '-DUSE_MESA', '', d)}"
