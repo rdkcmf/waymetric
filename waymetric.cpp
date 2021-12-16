@@ -41,7 +41,7 @@
 
 #include <vector>
 
-#define WAYMETRIC_VERSION "0.60"
+#define WAYMETRIC_VERSION "0.61"
 
 #define UNUSED(x) ((void)x)
 
@@ -217,6 +217,8 @@ typedef struct _AppCtx
    double waylandEGLFPS;
 
 } AppCtx;
+
+bool gVerbose= false;
 
 static long long getCurrentTimeMicro(void)
 {
@@ -2093,6 +2095,7 @@ void showUsage( void )
    printf("--no-nested\n");
    printf("--no-repeater\n");
    printf("--no-wayland-render\n");
+   printf("--verbose\n");
    printf("-? : show usage\n");
    printf("\n");
 }
@@ -2213,6 +2216,10 @@ int main( int argc, const char **argv )
          else if ( (len == 21) && !strncmp( argv[argidx], "--role-wayland-nested", len) )
          {
             roleWaylandNested= true;
+         }
+         else if ( (len == 9) && !strncmp( argv[argidx], "--verbose", len) )
+         {
+            gVerbose= true;
          }
       }
       else
